@@ -4,13 +4,23 @@ import { useState, useCallback } from 'react';
 import dynamic from 'next/dynamic';
 import { usePyodide } from '@/hooks/usePyodide';
 import { GraphData } from '@/components/GraphCalculator';
+import { GeometryElement } from '@/components/GeometryBoard';
 
-// Dynamically import GraphCalculator with SSR disabled
+// Dynamically import components with SSR disabled
 const GraphCalculator = dynamic(() => import('@/components/GraphCalculator'), { 
   ssr: false,
   loading: () => (
     <div className="w-full h-full flex items-center justify-center bg-gray-50 text-gray-400">
       Loading Graph Engine...
+    </div>
+  )
+});
+
+const GeometryBoard = dynamic(() => import('@/components/GeometryBoard'), { 
+  ssr: false,
+  loading: () => (
+    <div className="w-full h-full flex items-center justify-center bg-gray-50 text-gray-400">
+      Loading Geometry Engine...
     </div>
   )
 });
@@ -26,24 +36,45 @@ interface Annotation {
   text: string;
 }
 
+// 기하학 intent 목록
+const GEOMETRY_INTENTS = [
+  'draw_triangle', 'draw_rectangle', 'draw_square', 
+  'draw_circle', 'draw_polygon', 'draw_line', 
+  'draw_point', 'draw_multiple'
+];
+
 // 기본 색상 팔레트
 const COLORS = ['#3b82f6', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6'];
 
 // 고유 ID 생성
 let idCounter = 0;
-const generateId = () => `graph_${Date.now()}_${idCounter++}`;
+const generateId = () => `item_${Date.now()}_${idCounter++}`;
+
+type Mode = 'graph' | 'geometry';
 
 export default function DrawingApp() {
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'assistant', content: '안녕하세요! 그래프를 그려드릴게요. 예: "sin(x) 그래프 그려줘", "x² 미분해줘"' }
+    { role: 'assistant', content: '안녕하세요! 그래프나 도형을 그려드릴게요.\n📊 예: "sin(x) 그래프", "x² 미분"\n📐 예: "정삼각형 그려줘", "원 그려줘"' }
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [mode, setMode] = useState<Mode>('graph');
+  
+  // 함수 그래프 상태
   const [graphs, setGraphs] = useState<GraphData[]>([]);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   
+  // 기하학 상태
+  const [geometryElements, setGeometryElements] = useState<GeometryElement[]>([]);
+  
   // Pyodide 훅 (SymPy 수식 변환용)
-  const { status: pyodideStatus, isReady: pyodideReady, processGraphCommand, convert } = usePyodide();
+  const { 
+    status: pyodideStatus, 
+    isReady: pyodideReady, 
+    processGraphCommand, 
+    processGeometryCommand,
+    convert 
+  } = usePyodide();
 
   // 그래프 업데이트 (수식 편집)
   const handleGraphUpdate = useCallback(async (id: string, newSympy: string) => {
@@ -75,6 +106,18 @@ export default function DrawingApp() {
     ));
   }, []);
 
+  // 기하학 요소 삭제
+  const handleElementDelete = useCallback((id: string) => {
+    setGeometryElements(prev => prev.filter(e => e.id !== id));
+  }, []);
+
+  // 기하학 요소 토글
+  const handleElementToggle = useCallback((id: string) => {
+    setGeometryElements(prev => prev.map(e => 
+      e.id === id ? { ...e, visible: !e.visible } : e
+    ));
+  }, []);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim()) return;
@@ -102,43 +145,77 @@ export default function DrawingApp() {
       const llmCommand = await res.json();
       console.log('LLM Command:', llmCommand);
 
-      // 2. Pyodide가 준비되면 브라우저에서 SymPy로 JS 코드 변환
+      // 2. intent에 따라 함수 그래프 또는 기하학 처리
+      const isGeometry = GEOMETRY_INTENTS.includes(llmCommand.intent);
+      
       if (pyodideReady) {
         try {
-          const result = await processGraphCommand(llmCommand);
-          console.log('SymPy Result:', result);
-          
-          if (result.success && result.graphs.length > 0) {
-            // 새 그래프 데이터 변환 (id, visible 추가)
-            const newGraphs: GraphData[] = result.graphs.map((g: any, idx: number) => ({
-              id: generateId(),
-              fn: g.fn || g.jsCode,
-              sympy: g.original || g.fn,
-              latex: g.latex || g.fn,
-              color: g.color || COLORS[idx % COLORS.length],
-              label: g.label,
-              visible: true
-            }));
+          if (isGeometry) {
+            // 기하학 모드로 전환 및 처리
+            setMode('geometry');
+            const result = await processGeometryCommand(llmCommand);
+            console.log('Geometry Result:', result);
             
-            setGraphs(newGraphs);
-            setAnnotations(result.annotations || []);
-            
-            setMessages(prev => [...prev, { 
-              role: 'assistant', 
-              content: result.explanation || llmCommand.explanation || '그래프를 생성했습니다.'
-            }]);
+            if (result.success && result.elements.length > 0) {
+              const newElements: GeometryElement[] = result.elements.map((el: any, idx: number) => ({
+                id: generateId(),
+                type: el.type,
+                vertices: el.vertices,
+                center: el.center,
+                radius: el.radius,
+                points: el.points,
+                coords: el.coords,
+                name: el.name,
+                color: el.color || COLORS[idx % COLORS.length],
+                label: el.label,
+                visible: true
+              }));
+              
+              setGeometryElements(newElements);
+              
+              setMessages(prev => [...prev, { 
+                role: 'assistant', 
+                content: result.explanation || llmCommand.explanation || '도형을 생성했습니다.'
+              }]);
+            } else {
+              throw new Error(result.error || '도형 생성 실패');
+            }
           } else {
-            throw new Error(result.error || '그래프 생성 실패');
+            // 함수 그래프 모드로 전환 및 처리
+            setMode('graph');
+            const result = await processGraphCommand(llmCommand);
+            console.log('SymPy Result:', result);
+            
+            if (result.success && result.graphs.length > 0) {
+              const newGraphs: GraphData[] = result.graphs.map((g: any, idx: number) => ({
+                id: generateId(),
+                fn: g.fn || g.jsCode,
+                sympy: g.original || g.fn,
+                latex: g.latex || g.fn,
+                color: g.color || COLORS[idx % COLORS.length],
+                label: g.label,
+                visible: true
+              }));
+              
+              setGraphs(newGraphs);
+              setAnnotations(result.annotations || []);
+              
+              setMessages(prev => [...prev, { 
+                role: 'assistant', 
+                content: result.explanation || llmCommand.explanation || '그래프를 생성했습니다.'
+              }]);
+            } else {
+              throw new Error(result.error || '그래프 생성 실패');
+            }
           }
         } catch (sympyError: any) {
           console.error('SymPy Error:', sympyError);
           setMessages(prev => [...prev, { 
             role: 'assistant', 
-            content: `수식 처리 오류: ${sympyError.message}. SymPy 엔진이 준비될 때까지 기다려주세요.`
+            content: `처리 오류: ${sympyError.message}. SymPy 엔진이 준비될 때까지 기다려주세요.`
           }]);
         }
       } else {
-        // Pyodide가 아직 준비되지 않은 경우 메시지만 표시
         setMessages(prev => [...prev, { 
           role: 'assistant', 
           content: `${llmCommand.explanation || '명령을 받았습니다.'} (SymPy 엔진 로딩 중...)`
@@ -173,6 +250,7 @@ export default function DrawingApp() {
           visible: true
         };
         setGraphs(prev => [...prev, newGraph]);
+        setMode('graph');
       }
     } catch (error) {
       console.error('수식 추가 실패:', error);
@@ -185,9 +263,36 @@ export default function DrawingApp() {
       <div className="w-full md:w-1/3 flex flex-col bg-white rounded-2xl shadow-2xl overflow-hidden">
         <div className="bg-gradient-to-r from-indigo-600 to-purple-600 p-4">
           <div className="flex items-center justify-between">
-            <h1 className="text-white font-bold text-xl">📊 Graph Calculator</h1>
+            <h1 className="text-white font-bold text-xl">
+              {mode === 'graph' ? '📊 Graph Calculator' : '📐 Geometry'}
+            </h1>
             <span className="text-xs text-indigo-200 bg-indigo-500/30 px-2 py-1 rounded-full">AI Powered</span>
           </div>
+          
+          {/* 모드 전환 탭 */}
+          <div className="mt-3 flex gap-2">
+            <button
+              onClick={() => setMode('graph')}
+              className={`flex-1 py-1.5 text-xs font-medium rounded-lg transition-all ${
+                mode === 'graph' 
+                  ? 'bg-white text-indigo-600' 
+                  : 'bg-indigo-500/30 text-indigo-200 hover:bg-indigo-500/50'
+              }`}
+            >
+              📊 함수 그래프
+            </button>
+            <button
+              onClick={() => setMode('geometry')}
+              className={`flex-1 py-1.5 text-xs font-medium rounded-lg transition-all ${
+                mode === 'geometry' 
+                  ? 'bg-white text-indigo-600' 
+                  : 'bg-indigo-500/30 text-indigo-200 hover:bg-indigo-500/50'
+              }`}
+            >
+              📐 기하학
+            </button>
+          </div>
+          
           {/* SymPy 엔진 상태 표시 */}
           <div className="mt-3 flex items-center gap-2">
             <div className={`w-2 h-2 rounded-full ${
@@ -206,7 +311,7 @@ export default function DrawingApp() {
         <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50">
           {messages.map((msg, idx) => (
             <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] p-3 rounded-2xl text-sm shadow-sm ${
+              <div className={`max-w-[85%] p-3 rounded-2xl text-sm shadow-sm whitespace-pre-line ${
                 msg.role === 'user' 
                   ? 'bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-br-sm' 
                   : 'bg-white text-gray-800 rounded-bl-sm border border-gray-100'
@@ -223,7 +328,7 @@ export default function DrawingApp() {
                   <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '150ms'}}></span>
                   <span className="w-2 h-2 bg-pink-400 rounded-full animate-bounce" style={{animationDelay: '300ms'}}></span>
                 </div>
-                <span className="text-gray-500">계산 중...</span>
+                <span className="text-gray-500">처리 중...</span>
               </div>
             </div>
           )}
@@ -232,46 +337,81 @@ export default function DrawingApp() {
         {/* 예시 버튼 영역 */}
         <div className="px-4 py-3 border-t bg-white">
           <div className="flex items-center justify-between mb-2">
-            <p className="text-xs text-gray-500">예시:</p>
-            <button
-              onClick={handleAddExpression}
-              disabled={!pyodideReady}
-              className="text-xs px-2 py-1 bg-gray-100 text-gray-600 rounded hover:bg-gray-200 disabled:opacity-50"
-            >
-              + 수식 추가
-            </button>
+            <p className="text-xs text-gray-500">
+              {mode === 'graph' ? '📊 함수 예시:' : '📐 도형 예시:'}
+            </p>
+            {mode === 'graph' && (
+              <button
+                onClick={handleAddExpression}
+                disabled={!pyodideReady}
+                className="text-xs px-2 py-1 bg-gray-100 text-gray-600 rounded hover:bg-gray-200 disabled:opacity-50"
+              >
+                + 수식 추가
+              </button>
+            )}
           </div>
           <div className="flex flex-wrap gap-2">
-            <button 
-              onClick={() => setInput('sin(x) 그래프 그려줘')}
-              className="text-xs px-3 py-1.5 bg-indigo-50 text-indigo-700 rounded-full hover:bg-indigo-100 transition-colors font-medium"
-            >
-              sin(x)
-            </button>
-            <button 
-              onClick={() => setInput('x² 그래프')}
-              className="text-xs px-3 py-1.5 bg-purple-50 text-purple-700 rounded-full hover:bg-purple-100 transition-colors font-medium"
-            >
-              x²
-            </button>
-            <button 
-              onClick={() => setInput('sin(x) 미분해줘')}
-              className="text-xs px-3 py-1.5 bg-pink-50 text-pink-700 rounded-full hover:bg-pink-100 transition-colors font-medium"
-            >
-              미분
-            </button>
-            <button 
-              onClick={() => setInput('x² - 4 = 0 근 찾기')}
-              className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-full hover:bg-green-100 transition-colors font-medium"
-            >
-              방정식
-            </button>
-            <button 
-              onClick={() => setInput('exp(-x²) 그래프')}
-              className="text-xs px-3 py-1.5 bg-orange-50 text-orange-700 rounded-full hover:bg-orange-100 transition-colors font-medium"
-            >
-              가우시안
-            </button>
+            {mode === 'graph' ? (
+              <>
+                <button 
+                  onClick={() => setInput('sin(x) 그래프 그려줘')}
+                  className="text-xs px-3 py-1.5 bg-indigo-50 text-indigo-700 rounded-full hover:bg-indigo-100 transition-colors font-medium"
+                >
+                  sin(x)
+                </button>
+                <button 
+                  onClick={() => setInput('x² 그래프')}
+                  className="text-xs px-3 py-1.5 bg-purple-50 text-purple-700 rounded-full hover:bg-purple-100 transition-colors font-medium"
+                >
+                  x²
+                </button>
+                <button 
+                  onClick={() => setInput('sin(x) 미분해줘')}
+                  className="text-xs px-3 py-1.5 bg-pink-50 text-pink-700 rounded-full hover:bg-pink-100 transition-colors font-medium"
+                >
+                  미분
+                </button>
+                <button 
+                  onClick={() => setInput('exp(-x²) 그래프')}
+                  className="text-xs px-3 py-1.5 bg-orange-50 text-orange-700 rounded-full hover:bg-orange-100 transition-colors font-medium"
+                >
+                  가우시안
+                </button>
+              </>
+            ) : (
+              <>
+                <button 
+                  onClick={() => setInput('정삼각형 그려줘')}
+                  className="text-xs px-3 py-1.5 bg-blue-50 text-blue-700 rounded-full hover:bg-blue-100 transition-colors font-medium"
+                >
+                  정삼각형
+                </button>
+                <button 
+                  onClick={() => setInput('원 그려줘')}
+                  className="text-xs px-3 py-1.5 bg-red-50 text-red-700 rounded-full hover:bg-red-100 transition-colors font-medium"
+                >
+                  원
+                </button>
+                <button 
+                  onClick={() => setInput('정사각형 그려줘')}
+                  className="text-xs px-3 py-1.5 bg-purple-50 text-purple-700 rounded-full hover:bg-purple-100 transition-colors font-medium"
+                >
+                  정사각형
+                </button>
+                <button 
+                  onClick={() => setInput('정오각형 그려줘')}
+                  className="text-xs px-3 py-1.5 bg-amber-50 text-amber-700 rounded-full hover:bg-amber-100 transition-colors font-medium"
+                >
+                  정오각형
+                </button>
+                <button 
+                  onClick={() => setInput('직각삼각형 그려줘')}
+                  className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-full hover:bg-green-100 transition-colors font-medium"
+                >
+                  직각삼각형
+                </button>
+              </>
+            )}
           </div>
         </div>
 
@@ -280,7 +420,7 @@ export default function DrawingApp() {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="수식이나 명령을 입력하세요..."
+            placeholder={mode === 'graph' ? "수식을 입력하세요... (예: sin(x))" : "도형을 입력하세요... (예: 정삼각형)"}
             className="flex-1 px-4 py-2.5 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-gray-800 bg-gray-50"
             disabled={loading}
           />
@@ -294,15 +434,23 @@ export default function DrawingApp() {
         </form>
       </div>
 
-      {/* Right Panel: Graph Canvas */}
+      {/* Right Panel: Canvas (Graph or Geometry) */}
       <div className="w-full md:w-2/3 bg-white rounded-2xl shadow-2xl overflow-hidden">
-        <GraphCalculator 
-          graphs={graphs}
-          annotations={annotations}
-          onGraphUpdate={handleGraphUpdate}
-          onGraphDelete={handleGraphDelete}
-          onGraphToggle={handleGraphToggle}
-        />
+        {mode === 'graph' ? (
+          <GraphCalculator 
+            graphs={graphs}
+            annotations={annotations}
+            onGraphUpdate={handleGraphUpdate}
+            onGraphDelete={handleGraphDelete}
+            onGraphToggle={handleGraphToggle}
+          />
+        ) : (
+          <GeometryBoard
+            elements={geometryElements}
+            onElementDelete={handleElementDelete}
+            onElementToggle={handleElementToggle}
+          />
+        )}
       </div>
     </main>
   );

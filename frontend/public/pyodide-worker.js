@@ -161,6 +161,244 @@ def find_critical_points(expr_str):
             'error': str(e)
         })
 
+def create_triangle(vertices_or_type, *args):
+    """
+    삼각형 생성
+    - 정삼각형: create_triangle('equilateral', center, side_length)
+    - 직각삼각형: create_triangle('right', origin, width, height)
+    - 일반 삼각형: create_triangle([(x1,y1), (x2,y2), (x3,y3)])
+    """
+    from sympy.geometry import Point, Triangle, RegularPolygon
+    import math
+    
+    try:
+        if isinstance(vertices_or_type, str):
+            if vertices_or_type == 'equilateral':
+                # 정삼각형
+                center = args[0] if args else (0, 0)
+                side = args[1] if len(args) > 1 else 4
+                cx, cy = center
+                # 정삼각형 꼭짓점 계산
+                h = side * math.sqrt(3) / 2
+                vertices = [
+                    (cx, cy + h * 2/3),           # 상단
+                    (cx - side/2, cy - h/3),      # 좌하단
+                    (cx + side/2, cy - h/3)       # 우하단
+                ]
+            elif vertices_or_type == 'right':
+                # 직각삼각형
+                origin = args[0] if args else (0, 0)
+                width = args[1] if len(args) > 1 else 4
+                height = args[2] if len(args) > 2 else 3
+                ox, oy = origin
+                vertices = [
+                    (ox, oy),
+                    (ox + width, oy),
+                    (ox, oy + height)
+                ]
+            elif vertices_or_type == 'isosceles':
+                # 이등변삼각형
+                base_center = args[0] if args else (0, 0)
+                base = args[1] if len(args) > 1 else 4
+                height = args[2] if len(args) > 2 else 3
+                cx, cy = base_center
+                vertices = [
+                    (cx, cy + height),
+                    (cx - base/2, cy),
+                    (cx + base/2, cy)
+                ]
+            else:
+                vertices = [(0, 0), (4, 0), (2, 3)]  # 기본 삼각형
+        else:
+            vertices = vertices_or_type
+        
+        return {
+            'type': 'polygon',
+            'vertices': [list(v) for v in vertices],  # 튜플을 리스트로 변환
+            'name': 'triangle'
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
+def create_rectangle(center, width, height):
+    """사각형 생성"""
+    cx, cy = center
+    hw, hh = width/2, height/2
+    return {
+        'type': 'polygon',
+        'vertices': [
+            [cx - hw, cy - hh],
+            [cx + hw, cy - hh],
+            [cx + hw, cy + hh],
+            [cx - hw, cy + hh]
+        ],
+        'name': 'rectangle'
+    }
+
+def create_regular_polygon(center, n, radius):
+    """정다각형 생성"""
+    import math
+    cx, cy = center
+    vertices = []
+    for i in range(n):
+        angle = 2 * math.pi * i / n - math.pi / 2  # 상단에서 시작
+        x = cx + radius * math.cos(angle)
+        y = cy + radius * math.sin(angle)
+        vertices.append([x, y])  # 리스트로 추가
+    return {
+        'type': 'polygon',
+        'vertices': vertices,
+        'name': f'regular_{n}gon'
+    }
+
+def create_circle(center, radius):
+    """원 생성"""
+    return {
+        'type': 'circle',
+        'center': list(center),  # 튜플을 리스트로 변환
+        'radius': radius
+    }
+
+def create_line(point1, point2):
+    """선분 생성"""
+    return {
+        'type': 'segment',
+        'points': [list(point1), list(point2)]  # 튜플을 리스트로 변환
+    }
+
+def create_point(coords, name=None):
+    """점 생성"""
+    return {
+        'type': 'point',
+        'coords': list(coords),  # 튜플을 리스트로 변환
+        'name': name
+    }
+
+def process_geometry_command(command):
+    """
+    기하학 명령 처리
+    """
+    try:
+        intent = command.get('intent', '')
+        data = command.get('data', {})
+        
+        result = {
+            'success': True,
+            'elements': [],
+            'explanation': command.get('explanation', '')
+        }
+        
+        if intent == 'draw_triangle':
+            triangle_type = data.get('type', 'equilateral')
+            center = tuple(data.get('center', [0, 0]))
+            
+            if triangle_type == 'equilateral':
+                side = data.get('side', 4)
+                tri = create_triangle('equilateral', center, side)
+            elif triangle_type == 'right':
+                width = data.get('width', 4)
+                height = data.get('height', 3)
+                tri = create_triangle('right', center, width, height)
+            elif triangle_type == 'isosceles':
+                base = data.get('base', 4)
+                height = data.get('height', 3)
+                tri = create_triangle('isosceles', center, base, height)
+            else:
+                vertices = data.get('vertices', [[0,0], [4,0], [2,3]])
+                tri = create_triangle([(v[0], v[1]) for v in vertices])
+            
+            if 'error' not in tri:
+                result['elements'].append({
+                    **tri,
+                    'color': data.get('color', '#3b82f6'),
+                    'label': data.get('label', 'Triangle')
+                })
+            else:
+                result['error'] = tri['error']
+        
+        elif intent == 'draw_rectangle':
+            center = tuple(data.get('center', [0, 0]))
+            width = data.get('width', 4)
+            height = data.get('height', 3)
+            rect = create_rectangle(center, width, height)
+            result['elements'].append({
+                **rect,
+                'color': data.get('color', '#22c55e'),
+                'label': data.get('label', 'Rectangle')
+            })
+        
+        elif intent == 'draw_square':
+            center = tuple(data.get('center', [0, 0]))
+            side = data.get('side', 4)
+            square = create_rectangle(center, side, side)
+            result['elements'].append({
+                **square,
+                'color': data.get('color', '#8b5cf6'),
+                'label': data.get('label', 'Square')
+            })
+        
+        elif intent == 'draw_circle':
+            center = tuple(data.get('center', [0, 0]))
+            radius = data.get('radius', 3)
+            circle = create_circle(center, radius)
+            result['elements'].append({
+                **circle,
+                'color': data.get('color', '#ef4444'),
+                'label': data.get('label', 'Circle')
+            })
+        
+        elif intent == 'draw_polygon':
+            n = data.get('sides', 5)
+            center = tuple(data.get('center', [0, 0]))
+            radius = data.get('radius', 3)
+            poly = create_regular_polygon(center, n, radius)
+            result['elements'].append({
+                **poly,
+                'color': data.get('color', '#f59e0b'),
+                'label': data.get('label', f'정{n}각형')
+            })
+        
+        elif intent == 'draw_line':
+            point1 = tuple(data.get('point1', [0, 0]))
+            point2 = tuple(data.get('point2', [4, 4]))
+            line = create_line(point1, point2)
+            result['elements'].append({
+                **line,
+                'color': data.get('color', '#6366f1'),
+                'label': data.get('label', 'Line')
+            })
+        
+        elif intent == 'draw_point':
+            coords = tuple(data.get('coords', [0, 0]))
+            name = data.get('name', 'P')
+            point = create_point(coords, name)
+            result['elements'].append({
+                **point,
+                'color': data.get('color', '#000000'),
+                'label': name
+            })
+        
+        elif intent == 'draw_multiple':
+            # 여러 도형 동시 그리기
+            shapes = data.get('shapes', [])
+            for shape in shapes:
+                shape_type = shape.get('type')
+                if shape_type == 'triangle':
+                    result['elements'].append(create_triangle('equilateral', tuple(shape.get('center', [0,0])), shape.get('side', 3)))
+                elif shape_type == 'circle':
+                    result['elements'].append(create_circle(tuple(shape.get('center', [0,0])), shape.get('radius', 2)))
+                elif shape_type == 'rectangle':
+                    result['elements'].append(create_rectangle(tuple(shape.get('center', [0,0])), shape.get('width', 3), shape.get('height', 2)))
+        
+        return json.dumps(result)
+        
+    except Exception as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e),
+            'elements': []
+        })
+
 def process_graph_command(command):
     """
     그래프 명령 처리 메인 함수
@@ -168,6 +406,13 @@ def process_graph_command(command):
     try:
         intent = command.get('intent', '')
         data = command.get('data', {})
+        
+        # 기하학 intent는 별도 함수로 처리
+        geometry_intents = ['draw_triangle', 'draw_rectangle', 'draw_square', 
+                          'draw_circle', 'draw_polygon', 'draw_line', 
+                          'draw_point', 'draw_multiple']
+        if intent in geometry_intents:
+            return process_geometry_command(command)
         
         result = {
             'success': True,
@@ -387,6 +632,23 @@ differentiate(${JSON.stringify(payload.expression)}, ${payload.order || 1})
       
       const resultJson = await pyodide.runPythonAsync(`
 integrate_expr(${JSON.stringify(payload.expression)})
+      `);
+      
+      self.postMessage({
+        type: 'result',
+        id: id,
+        payload: JSON.parse(resultJson)
+      });
+    }
+
+    if (type === 'geometry') {
+      // 기하학 명령 처리
+      if (!pyodide || !sympyLoaded) {
+        await initPyodide();
+      }
+      
+      const resultJson = await pyodide.runPythonAsync(`
+process_geometry_command(${JSON.stringify(payload)})
       `);
       
       self.postMessage({
