@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "function-plot": "^1.25.1",
     "jsxgraph": "^1.12.2",
     "next": "16.0.8",
     "react": "19.2.1",

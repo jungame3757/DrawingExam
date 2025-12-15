@@ -1,14 +1,17 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import dynamic from 'next/dynamic';
-import { GeometryElement } from '@/types';
 import { usePyodide } from '@/hooks/usePyodide';
 
-// Dynamically import GeometryBoard with SSR disabled
-const GeometryBoard = dynamic(() => import('@/components/GeometryBoard'), { 
+// Dynamically import GraphCalculator with SSR disabled
+const GraphCalculator = dynamic(() => import('@/components/GraphCalculator'), { 
   ssr: false,
-  loading: () => <div className="w-full h-full flex items-center justify-center bg-gray-50 text-gray-400">Loading Geometry Engine...</div>
+  loading: () => (
+    <div className="w-full h-full flex items-center justify-center bg-gray-50 text-gray-400">
+      Loading Graph Engine...
+    </div>
+  )
 });
 
 interface Message {
@@ -16,23 +19,31 @@ interface Message {
   content: string;
 }
 
-type ComputeMode = 'server' | 'client' | 'auto';
+interface GraphData {
+  fn: string;
+  color?: string;
+  latex?: string;
+  label?: string;
+  original?: string;
+}
+
+interface Annotation {
+  x: number;
+  y: number;
+  text: string;
+}
 
 export default function DrawingApp() {
   const [messages, setMessages] = useState<Message[]>([
-    { role: 'assistant', content: '안녕하세요! 무엇을 그려드릴까요? (예: "정삼각형을 그려줘", "반지름 5인 원")' }
+    { role: 'assistant', content: '안녕하세요! 그래프를 그려드릴게요. 예: "sin(x) 그래프 그려줘", "x² 미분해줘"' }
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [elements, setElements] = useState<GeometryElement[]>([]);
-  const [computeMode, setComputeMode] = useState<ComputeMode>('auto');
+  const [graphs, setGraphs] = useState<GraphData[]>([]);
+  const [annotations, setAnnotations] = useState<Annotation[]>([]);
   
-  // Pyodide 훅 (클라이언트 사이드 계산용)
-  const { status: pyodideStatus, isReady: pyodideReady, calculate: pyodideCalculate } = usePyodide();
-
-  const handleElementsUpdate = (updatedElements: GeometryElement[]) => {
-    setElements(updatedElements);
-  };
+  // Pyodide 훅 (SymPy 수식 변환용)
+  const { status: pyodideStatus, isReady: pyodideReady, processGraphCommand } = usePyodide();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -44,26 +55,12 @@ export default function DrawingApp() {
     setLoading(true);
 
     try {
-      // 현재 도형 컨텍스트 구성
-      let fullPrompt = userMsg.content;
-      
-      const points = elements.filter(el => el.type === 'point');
-      if (points.length > 0) {
-        const coordsStr = points.map(p => {
-          const x = typeof p.parents[0] === 'number' ? Number(p.parents[0]).toFixed(2) : '?';
-          const y = typeof p.parents[1] === 'number' ? Number(p.parents[1]).toFixed(2) : '?';
-          return `${p.props?.name || p.id}: [${x}, ${y}]`;
-        }).join(', ');
-        
-        fullPrompt += `\n\n[Context: Current Geometry State]\n현재 점들: ${coordsStr}`;
-      }
-
-      // 서버에서 LLM 의도 파싱 및 좌표 계산
+      // 1. 서버에서 LLM으로 사용자 의도 파싱
       const res = await fetch('http://localhost:8000/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          prompt: fullPrompt,
+          prompt: input,
           history: messages.slice(1)
         }),
       });
@@ -72,74 +69,83 @@ export default function DrawingApp() {
         throw new Error('API Request Failed');
       }
 
-      const data = await res.json();
-      
-      // 도형 업데이트
-      if (data.elements) {
-        setElements(data.elements);
+      const llmCommand = await res.json();
+      console.log('LLM Command:', llmCommand);
+
+      // 2. Pyodide가 준비되면 브라우저에서 SymPy로 JS 코드 변환
+      if (pyodideReady) {
+        try {
+          const result = await processGraphCommand(llmCommand);
+          console.log('SymPy Result:', result);
+          
+          if (result.success && result.graphs.length > 0) {
+            setGraphs(result.graphs);
+            setAnnotations(result.annotations || []);
+            
+            setMessages(prev => [...prev, { 
+              role: 'assistant', 
+              content: result.explanation || llmCommand.explanation || '그래프를 생성했습니다.'
+            }]);
+          } else {
+            throw new Error(result.error || '그래프 생성 실패');
+          }
+        } catch (sympyError: any) {
+          console.error('SymPy Error:', sympyError);
+          setMessages(prev => [...prev, { 
+            role: 'assistant', 
+            content: `수식 처리 오류: ${sympyError.message}. SymPy 엔진이 준비될 때까지 기다려주세요.`
+          }]);
+        }
+      } else {
+        // Pyodide가 아직 준비되지 않은 경우 메시지만 표시
+        setMessages(prev => [...prev, { 
+          role: 'assistant', 
+          content: `${llmCommand.explanation || '명령을 받았습니다.'} (SymPy 엔진 로딩 중...)`
+        }]);
       }
 
-      // 어시스턴트 메시지 추가
+    } catch (error: any) {
+      console.error(error);
       setMessages(prev => [...prev, { 
         role: 'assistant', 
-        content: data.explanation || '도형을 생성했습니다.' 
+        content: `오류가 발생했습니다: ${error.message}`
       }]);
-
-    } catch (error) {
-      console.error(error);
-      setMessages(prev => [...prev, { role: 'assistant', content: '오류가 발생했습니다. 다시 시도해주세요.' }]);
     } finally {
       setLoading(false);
     }
   };
 
-  // 클라이언트 사이드 계산 테스트 (Pyodide 준비 시)
-  const handleClientCalculate = async (intent: string, data: Record<string, any>) => {
-    if (!pyodideReady) {
-      console.warn('Pyodide not ready');
-      return null;
-    }
-    
-    try {
-      const result = await pyodideCalculate({ intent, data });
-      return result;
-    } catch (error) {
-      console.error('Client calculation error:', error);
-      return null;
-    }
-  };
-
   return (
-    <main className="flex h-screen flex-col md:flex-row bg-gray-100 p-4 gap-4">
+    <main className="flex h-screen flex-col md:flex-row bg-gradient-to-br from-slate-900 to-slate-800 p-4 gap-4">
       {/* Left Panel: Chat Interface */}
-      <div className="w-full md:w-1/3 flex flex-col bg-white rounded-xl shadow-lg overflow-hidden">
-        <div className="bg-indigo-600 p-4">
+      <div className="w-full md:w-1/3 flex flex-col bg-white rounded-2xl shadow-2xl overflow-hidden">
+        <div className="bg-gradient-to-r from-indigo-600 to-purple-600 p-4">
           <div className="flex items-center justify-between">
-            <h1 className="text-white font-bold text-lg">AI Geometry Copilot</h1>
-            <span className="text-xs text-indigo-200">v2.0</span>
+            <h1 className="text-white font-bold text-xl">📊 Graph Calculator</h1>
+            <span className="text-xs text-indigo-200 bg-indigo-500/30 px-2 py-1 rounded-full">AI Powered</span>
           </div>
-          {/* Pyodide 상태 표시 */}
-          <div className="mt-2 flex items-center gap-2">
+          {/* SymPy 엔진 상태 표시 */}
+          <div className="mt-3 flex items-center gap-2">
             <div className={`w-2 h-2 rounded-full ${
               pyodideStatus.status === 'ready' ? 'bg-green-400' :
               pyodideStatus.status === 'loading' ? 'bg-yellow-400 animate-pulse' :
               pyodideStatus.status === 'error' ? 'bg-red-400' : 'bg-gray-400'
             }`} />
             <span className="text-xs text-indigo-200">
-              {pyodideStatus.status === 'ready' ? 'SymPy 엔진 준비됨' :
+              {pyodideStatus.status === 'ready' ? '✓ SymPy 엔진 준비됨' :
                pyodideStatus.status === 'loading' ? pyodideStatus.message :
                pyodideStatus.status === 'error' ? '엔진 오류' : '엔진 대기 중'}
             </span>
           </div>
         </div>
         
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50">
           {messages.map((msg, idx) => (
             <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[80%] p-3 rounded-lg text-sm ${
+              <div className={`max-w-[85%] p-3 rounded-2xl text-sm shadow-sm ${
                 msg.role === 'user' 
-                  ? 'bg-indigo-500 text-white rounded-br-none' 
-                  : 'bg-gray-100 text-gray-800 rounded-bl-none'
+                  ? 'bg-gradient-to-r from-indigo-500 to-purple-500 text-white rounded-br-sm' 
+                  : 'bg-white text-gray-800 rounded-bl-sm border border-gray-100'
               }`}>
                 {msg.content}
               </div>
@@ -147,72 +153,79 @@ export default function DrawingApp() {
           ))}
           {loading && (
             <div className="flex justify-start">
-              <div className="bg-gray-100 p-3 rounded-lg text-sm flex items-center gap-2">
+              <div className="bg-white p-3 rounded-2xl text-sm flex items-center gap-2 shadow-sm border border-gray-100">
                 <div className="flex gap-1">
                   <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce" style={{animationDelay: '0ms'}}></span>
-                  <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce" style={{animationDelay: '150ms'}}></span>
-                  <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce" style={{animationDelay: '300ms'}}></span>
+                  <span className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{animationDelay: '150ms'}}></span>
+                  <span className="w-2 h-2 bg-pink-400 rounded-full animate-bounce" style={{animationDelay: '300ms'}}></span>
                 </div>
-                <span className="text-gray-500">생성 중...</span>
+                <span className="text-gray-500">계산 중...</span>
               </div>
             </div>
           )}
         </div>
 
         {/* 예시 버튼 영역 */}
-        <div className="px-4 py-2 border-t bg-gray-50">
+        <div className="px-4 py-3 border-t bg-white">
+          <p className="text-xs text-gray-500 mb-2">예시:</p>
           <div className="flex flex-wrap gap-2">
             <button 
-              onClick={() => setInput('정삼각형을 그려줘')}
-              className="text-xs px-2 py-1 bg-indigo-100 text-indigo-700 rounded-full hover:bg-indigo-200 transition-colors"
+              onClick={() => setInput('sin(x) 그래프 그려줘')}
+              className="text-xs px-3 py-1.5 bg-indigo-50 text-indigo-700 rounded-full hover:bg-indigo-100 transition-colors font-medium"
             >
-              정삼각형
+              sin(x)
             </button>
             <button 
-              onClick={() => setInput('반지름 5인 원을 그려줘')}
-              className="text-xs px-2 py-1 bg-indigo-100 text-indigo-700 rounded-full hover:bg-indigo-200 transition-colors"
+              onClick={() => setInput('x² 그래프')}
+              className="text-xs px-3 py-1.5 bg-purple-50 text-purple-700 rounded-full hover:bg-purple-100 transition-colors font-medium"
             >
-              원
+              x²
             </button>
             <button 
-              onClick={() => setInput('직각삼각형 밑변 4, 높이 3')}
-              className="text-xs px-2 py-1 bg-indigo-100 text-indigo-700 rounded-full hover:bg-indigo-200 transition-colors"
+              onClick={() => setInput('sin(x) 미분해줘')}
+              className="text-xs px-3 py-1.5 bg-pink-50 text-pink-700 rounded-full hover:bg-pink-100 transition-colors font-medium"
             >
-              직각삼각형
+              미분
             </button>
             <button 
-              onClick={() => setInput('정사각형 한 변 4')}
-              className="text-xs px-2 py-1 bg-indigo-100 text-indigo-700 rounded-full hover:bg-indigo-200 transition-colors"
+              onClick={() => setInput('x² - 4 = 0 근 찾기')}
+              className="text-xs px-3 py-1.5 bg-green-50 text-green-700 rounded-full hover:bg-green-100 transition-colors font-medium"
             >
-              정사각형
+              방정식
+            </button>
+            <button 
+              onClick={() => setInput('exp(-x²) 그래프')}
+              className="text-xs px-3 py-1.5 bg-orange-50 text-orange-700 rounded-full hover:bg-orange-100 transition-colors font-medium"
+            >
+              가우시안
             </button>
           </div>
         </div>
 
-        <form onSubmit={handleSubmit} className="p-4 border-t bg-gray-50 flex gap-2">
+        <form onSubmit={handleSubmit} className="p-4 border-t bg-white flex gap-2">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="도형을 설명해주세요..."
-            className="flex-1 px-4 py-2 border rounded-full focus:outline-none focus:ring-2 focus:ring-indigo-500 text-black"
+            placeholder="수식이나 명령을 입력하세요..."
+            className="flex-1 px-4 py-2.5 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent text-gray-800 bg-gray-50"
             disabled={loading}
           />
           <button 
             type="submit" 
             disabled={loading}
-            className="bg-indigo-600 text-white px-6 py-2 rounded-full hover:bg-indigo-700 disabled:bg-gray-400 transition-colors font-medium"
+            className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white px-6 py-2.5 rounded-xl hover:from-indigo-700 hover:to-purple-700 disabled:from-gray-400 disabled:to-gray-400 transition-all font-medium shadow-lg shadow-indigo-500/25"
           >
-            전송
+            실행
           </button>
         </form>
       </div>
 
-      {/* Right Panel: Geometry Board */}
-      <div className="w-full md:w-2/3 bg-white rounded-xl shadow-lg overflow-hidden p-2">
-        <GeometryBoard 
-          elements={elements} 
-          onElementsUpdate={handleElementsUpdate}
+      {/* Right Panel: Graph Canvas */}
+      <div className="w-full md:w-2/3 bg-white rounded-2xl shadow-2xl overflow-hidden">
+        <GraphCalculator 
+          graphs={graphs}
+          annotations={annotations}
         />
       </div>
     </main>

@@ -1,22 +1,40 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { GeometryElement } from '@/types';
 
 interface PyodideStatus {
   status: 'idle' | 'loading' | 'ready' | 'error';
   message: string;
 }
 
-interface GeometryCommand {
-  intent: string;
-  data: Record<string, any>;
+interface GraphData {
+  fn: string;
+  color?: string;
+  latex?: string;
+  label?: string;
+  original?: string;
+  error?: string;
 }
 
-interface GeometryResult {
-  elements: GeometryElement[];
+interface Annotation {
+  x: number;
+  y: number;
+  text: string;
+}
+
+interface GraphResult {
+  success: boolean;
+  graphs: GraphData[];
+  annotations: Annotation[];
   explanation: string;
-  value?: number;
+  error?: string;
+}
+
+interface ConvertResult {
+  success: boolean;
+  jsCode?: string;
+  latex?: string;
+  simplified?: string;
   error?: string;
 }
 
@@ -28,7 +46,7 @@ export function usePyodide() {
   const [isReady, setIsReady] = useState(false);
   const workerRef = useRef<Worker | null>(null);
   const pendingRequests = useRef<Map<string, {
-    resolve: (value: GeometryResult) => void;
+    resolve: (value: any) => void;
     reject: (error: Error) => void;
   }>>(new Map());
 
@@ -76,8 +94,8 @@ export function usePyodide() {
     };
   }, []);
 
-  // 기하학 계산 실행
-  const calculate = useCallback((command: GeometryCommand): Promise<GeometryResult> => {
+  // 수식 → JS 코드 변환
+  const convert = useCallback((expression: string): Promise<ConvertResult> => {
     return new Promise((resolve, reject) => {
       if (!workerRef.current) {
         reject(new Error('Worker not initialized'));
@@ -86,9 +104,83 @@ export function usePyodide() {
 
       const id = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       
-      pendingRequests.current.set(id, { resolve, reject });
-
       // 타임아웃 설정 (30초)
+      const timeout = setTimeout(() => {
+        if (pendingRequests.current.has(id)) {
+          pendingRequests.current.delete(id);
+          reject(new Error('변환 시간 초과'));
+        }
+      }, 30000);
+
+      pendingRequests.current.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
+
+      workerRef.current.postMessage({
+        type: 'convert',
+        id,
+        payload: { expression }
+      });
+    });
+  }, []);
+
+  // 그래프 명령 처리
+  const processGraphCommand = useCallback((command: {
+    intent: string;
+    data: Record<string, any>;
+    explanation?: string;
+  }): Promise<GraphResult> => {
+    return new Promise((resolve, reject) => {
+      if (!workerRef.current) {
+        reject(new Error('Worker not initialized'));
+        return;
+      }
+
+      const id = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const timeout = setTimeout(() => {
+        if (pendingRequests.current.has(id)) {
+          pendingRequests.current.delete(id);
+          reject(new Error('처리 시간 초과'));
+        }
+      }, 30000);
+
+      pendingRequests.current.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
+
+      workerRef.current.postMessage({
+        type: 'process',
+        id,
+        payload: command
+      });
+    });
+  }, []);
+
+  // 미분 계산
+  const differentiate = useCallback((expression: string, order: number = 1): Promise<ConvertResult> => {
+    return new Promise((resolve, reject) => {
+      if (!workerRef.current) {
+        reject(new Error('Worker not initialized'));
+        return;
+      }
+
+      const id = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
       const timeout = setTimeout(() => {
         if (pendingRequests.current.has(id)) {
           pendingRequests.current.delete(id);
@@ -96,25 +188,57 @@ export function usePyodide() {
         }
       }, 30000);
 
-      workerRef.current.postMessage({
-        type: 'calculate',
-        id,
-        payload: command
-      });
-
-      // 성공/실패 시 타임아웃 클리어
-      const originalResolve = resolve;
-      const originalReject = reject;
-      
       pendingRequests.current.set(id, {
         resolve: (value) => {
           clearTimeout(timeout);
-          originalResolve(value);
+          resolve(value);
         },
         reject: (error) => {
           clearTimeout(timeout);
-          originalReject(error);
+          reject(error);
         }
+      });
+
+      workerRef.current.postMessage({
+        type: 'differentiate',
+        id,
+        payload: { expression, order }
+      });
+    });
+  }, []);
+
+  // 적분 계산
+  const integrate = useCallback((expression: string): Promise<ConvertResult> => {
+    return new Promise((resolve, reject) => {
+      if (!workerRef.current) {
+        reject(new Error('Worker not initialized'));
+        return;
+      }
+
+      const id = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      
+      const timeout = setTimeout(() => {
+        if (pendingRequests.current.has(id)) {
+          pendingRequests.current.delete(id);
+          reject(new Error('계산 시간 초과'));
+        }
+      }, 30000);
+
+      pendingRequests.current.set(id, {
+        resolve: (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
+
+      workerRef.current.postMessage({
+        type: 'integrate',
+        id,
+        payload: { expression }
       });
     });
   }, []);
@@ -147,8 +271,10 @@ export function usePyodide() {
   return {
     status,
     isReady,
-    calculate,
+    convert,
+    processGraphCommand,
+    differentiate,
+    integrate,
     restart
   };
 }
-

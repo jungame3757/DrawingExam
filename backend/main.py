@@ -1,12 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Union, Optional, Dict, Any
+from typing import List, Optional, Dict, Any
 import os
 import google.generativeai as genai
 from dotenv import load_dotenv
 import json
-import math
 
 load_dotenv()
 
@@ -32,14 +31,9 @@ app.add_middleware(
 )
 
 # --- Data Models ---
-class GeometryElement(BaseModel):
-    id: str = Field(..., description="Unique identifier for the element")
-    type: str = Field(..., description="Type of element")
-    parents: List[Union[float, str]] = Field(..., description="List of parent elements or coordinates")
-    props: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Visual properties")
-
-class GeometryResponse(BaseModel):
-    elements: List[GeometryElement]
+class GraphCommand(BaseModel):
+    intent: str
+    data: Dict[str, Any]
     explanation: str
 
 class ChatMessage(BaseModel):
@@ -50,12 +44,14 @@ class PromptRequest(BaseModel):
     prompt: str
     history: Optional[List[ChatMessage]] = Field(default_factory=list)
 
-# --- NEW: Intent-based System Instruction ---
-# LLM은 좌표를 계산하지 않고, 의도(intent)와 파라미터만 출력
+# --- Graph Calculator System Instruction ---
+# 문서 설계: "LLM은 번역하고, 엔진은 계산한다"
+# LLM은 수식 문자열만 출력, SymPy가 JavaScript로 변환
 SYSTEM_INSTRUCTION = """
-You are a Geometry Intent Parser. Convert natural language to structured geometric commands.
+You are a Graph Calculator Assistant. Convert natural language math requests into structured commands.
 
-**YOUR ROLE**: Parse user intent into structured JSON. DO NOT calculate coordinates - the math engine will do that.
+**YOUR ROLE**: Parse user intent into structured JSON with mathematical expressions. 
+DO NOT calculate - the SymPy engine will handle all math.
 
 **OUTPUT FORMAT**:
 {
@@ -66,329 +62,107 @@ You are a Geometry Intent Parser. Convert natural language to structured geometr
 
 **SUPPORTED INTENTS**:
 
-1. `create_triangle` - 삼각형 생성
-   - data: { "type": "equilateral|isosceles|right|general", "base_length": number, "anchor": [x, y], "height": number (optional) }
+1. `plot_function` - 함수 그래프 그리기
+   - data: { "expressions": ["sin(x)", "x**2", ...], "colors": ["blue", "red", ...] (optional) }
+   - 여러 함수를 동시에 그릴 수 있음
    
-2. `create_circle` - 원 생성
-   - data: { "center": [x, y], "radius": number, "name": string }
+2. `plot_derivative` - 도함수 그래프 그리기
+   - data: { "expression": "sin(x)", "order": 1 }
+   - 원본 함수와 도함수를 함께 표시
    
-3. `create_rectangle` - 직사각형 생성
-   - data: { "anchor": [x, y], "width": number, "height": number }
-   
-4. `create_square` - 정사각형 생성
-   - data: { "anchor": [x, y], "side": number }
+3. `plot_integral` - 적분 그래프 그리기
+   - data: { "expression": "x**2" }
+   - 원본 함수와 부정적분을 함께 표시
 
-5. `create_polygon` - 다각형 생성
-   - data: { "vertices": [[x1,y1], [x2,y2], ...], "names": ["A", "B", ...] }
+4. `solve_and_plot` - 방정식 풀이 및 그래프
+   - data: { "expression": "x**2 - 4" }
+   - 그래프와 함께 근(x절편)을 표시
 
-6. `create_point` - 점 생성
-   - data: { "x": number, "y": number, "name": string }
+5. `find_extrema` - 극값 찾기
+   - data: { "expression": "x**3 - 3*x" }
+   - 그래프와 함께 극대/극소점 표시
 
-7. `create_line` - 직선 생성
-   - data: { "point1": [x, y], "point2": [x, y] }
-
-8. `calculate_distance` - 거리 계산
-   - data: { "point1": [x, y], "point2": [x, y] }
-
-9. `calculate_midpoint` - 중점 계산
-   - data: { "point1": [x, y], "point2": [x, y] }
-
-10. `modify_element` - 요소 수정
-    - data: { "element_id": string, "property": string, "value": any }
+**MATH EXPRESSION SYNTAX** (SymPy format):
+- 기본 연산: +, -, *, /, ** (거듭제곱)
+- 삼각함수: sin(x), cos(x), tan(x), asin(x), acos(x), atan(x)
+- 지수/로그: exp(x), log(x) (자연로그), log(x, 10) (상용로그)
+- 제곱근: sqrt(x)
+- 절대값: Abs(x)
+- 상수: pi, E (자연상수)
+- 예시: "sin(x)**2 + cos(x)**2", "exp(-x**2)", "log(x)/x"
 
 **EXAMPLES**:
 
-User: "정삼각형을 그려줘"
+User: "y = sin x 그래프 그려줘"
 {
-  "intent": "create_triangle",
-  "data": { "type": "equilateral", "base_length": 5, "anchor": [0, 0] },
-  "explanation": "한 변의 길이가 5인 정삼각형을 그렸습니다."
+  "intent": "plot_function",
+  "data": { "expressions": ["sin(x)"] },
+  "explanation": "y = sin(x) 그래프를 그렸습니다."
 }
 
-User: "반지름이 3인 원을 중심 (2, 4)에 그려줘"
+User: "x제곱과 2x를 같이 그려줘"
 {
-  "intent": "create_circle",
-  "data": { "center": [2, 4], "radius": 3, "name": "O" },
-  "explanation": "중심이 (2, 4)이고 반지름이 3인 원을 그렸습니다."
+  "intent": "plot_function",
+  "data": { "expressions": ["x**2", "2*x"] },
+  "explanation": "y = x²과 y = 2x 그래프를 함께 그렸습니다."
 }
 
-User: "가로 6, 세로 4인 직사각형"
+User: "sin(x)의 미분 그래프"
 {
-  "intent": "create_rectangle",
-  "data": { "anchor": [0, 0], "width": 6, "height": 4 },
-  "explanation": "가로 6, 세로 4인 직사각형을 그렸습니다."
+  "intent": "plot_derivative",
+  "data": { "expression": "sin(x)", "order": 1 },
+  "explanation": "sin(x)와 그 도함수 cos(x)를 함께 그렸습니다."
 }
 
-User: "직각삼각형, 밑변 4, 높이 3"
+User: "x² - 4 = 0의 근을 그래프로 보여줘"
 {
-  "intent": "create_triangle",
-  "data": { "type": "right", "base_length": 4, "height": 3, "anchor": [0, 0] },
-  "explanation": "밑변 4, 높이 3인 직각삼각형을 그렸습니다."
+  "intent": "solve_and_plot",
+  "data": { "expression": "x**2 - 4" },
+  "explanation": "x² - 4 = 0의 근은 x = ±2입니다."
+}
+
+User: "x³ - 3x의 극값을 찾아줘"
+{
+  "intent": "find_extrema",
+  "data": { "expression": "x**3 - 3*x" },
+  "explanation": "x³ - 3x의 극값을 찾아 표시했습니다."
+}
+
+User: "e^(-x²) 그래프" (정규분포 모양)
+{
+  "intent": "plot_function",
+  "data": { "expressions": ["exp(-x**2)"] },
+  "explanation": "가우시안 함수 e^(-x²)를 그렸습니다."
+}
+
+User: "x² 적분해서 그려줘"
+{
+  "intent": "plot_integral",
+  "data": { "expression": "x**2" },
+  "explanation": "x²와 그 부정적분 x³/3을 함께 그렸습니다."
 }
 
 **RULES**:
 1. Return ONLY valid JSON
-2. Use reasonable default values (anchor: [0,0], base_length: 5, radius: 3)
+2. Use SymPy syntax for expressions (** for power, not ^)
 3. Explanation should be in Korean
-4. DO NOT calculate actual vertex coordinates - just provide parameters
-5. If user gives context about existing points, incorporate them
+4. For multiple functions, use "plot_function" with multiple expressions
+5. If unsure, default to "plot_function"
 """
-
-# --- SymPy-based Geometry Calculator ---
-def calculate_geometry(command: dict) -> dict:
-    """
-    수학 엔진: LLM의 의도(intent)를 받아 정확한 좌표를 계산
-    """
-    intent = command.get('intent', '')
-    data = command.get('data', {})
-    explanation = command.get('explanation', '')
-    
-    result = {'elements': [], 'explanation': explanation}
-    
-    try:
-        if intent == 'create_point':
-            x, y = data.get('x', 0), data.get('y', 0)
-            name = data.get('name', 'P')
-            result['elements'].append({
-                'id': f'p{name}',
-                'type': 'point',
-                'parents': [float(x), float(y)],
-                'props': {'name': name}
-            })
-            
-        elif intent == 'create_triangle':
-            triangle_type = data.get('type', 'general')
-            base = float(data.get('base_length', 5))
-            anchor = data.get('anchor', [0, 0])
-            ax, ay = float(anchor[0]), float(anchor[1])
-            
-            if triangle_type == 'equilateral':
-                # 정삼각형: 정확한 계산 (SymPy 대신 math 사용)
-                height = base * math.sqrt(3) / 2
-                points = [
-                    (ax, ay),                    # A
-                    (ax + base, ay),             # B  
-                    (ax + base/2, ay + height)   # C
-                ]
-                names = ['A', 'B', 'C']
-                
-            elif triangle_type == 'isosceles':
-                height = float(data.get('height', base * 0.8))
-                points = [
-                    (ax, ay),
-                    (ax + base, ay),
-                    (ax + base/2, ay + height)
-                ]
-                names = ['A', 'B', 'C']
-                
-            elif triangle_type == 'right':
-                height = float(data.get('height', base * 0.75))
-                points = [
-                    (ax, ay),           # A (직각)
-                    (ax + base, ay),    # B
-                    (ax, ay + height)   # C
-                ]
-                names = ['A', 'B', 'C']
-                
-            else:  # general
-                points = [
-                    (ax, ay),
-                    (ax + base, ay),
-                    (ax + base * 0.3, ay + base * 0.7)
-                ]
-                names = ['A', 'B', 'C']
-            
-            # 점 생성
-            for i, (px, py) in enumerate(points):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [round(px, 6), round(py, 6)],
-                    'props': {'name': names[i]}
-                })
-            
-            # 선분 생성
-            for i in range(3):
-                j = (i + 1) % 3
-                result['elements'].append({
-                    'id': f's{names[i]}{names[j]}',
-                    'type': 'segment',
-                    'parents': [f'p{names[i]}', f'p{names[j]}'],
-                    'props': {}
-                })
-                
-        elif intent == 'create_circle':
-            center = data.get('center', [0, 0])
-            radius = float(data.get('radius', 3))
-            name = data.get('name', 'O')
-            
-            result['elements'].append({
-                'id': f'p{name}',
-                'type': 'point',
-                'parents': [float(center[0]), float(center[1])],
-                'props': {'name': name}
-            })
-            
-            result['elements'].append({
-                'id': f'circle_{name}',
-                'type': 'circle',
-                'parents': [f'p{name}', radius],
-                'props': {}
-            })
-            
-        elif intent == 'create_rectangle':
-            anchor = data.get('anchor', [0, 0])
-            width = float(data.get('width', 4))
-            height = float(data.get('height', 3))
-            ax, ay = float(anchor[0]), float(anchor[1])
-            
-            points = [
-                (ax, ay),
-                (ax + width, ay),
-                (ax + width, ay + height),
-                (ax, ay + height)
-            ]
-            names = ['A', 'B', 'C', 'D']
-            
-            for i, (px, py) in enumerate(points):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [round(px, 6), round(py, 6)],
-                    'props': {'name': names[i]}
-                })
-            
-            point_ids = [f'p{name}' for name in names]
-            result['elements'].append({
-                'id': 'rect1',
-                'type': 'polygon',
-                'parents': point_ids,
-                'props': {}
-            })
-            
-        elif intent == 'create_square':
-            anchor = data.get('anchor', [0, 0])
-            side = float(data.get('side', 4))
-            ax, ay = float(anchor[0]), float(anchor[1])
-            
-            points = [
-                (ax, ay),
-                (ax + side, ay),
-                (ax + side, ay + side),
-                (ax, ay + side)
-            ]
-            names = ['A', 'B', 'C', 'D']
-            
-            for i, (px, py) in enumerate(points):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [round(px, 6), round(py, 6)],
-                    'props': {'name': names[i]}
-                })
-            
-            point_ids = [f'p{name}' for name in names]
-            result['elements'].append({
-                'id': 'square1',
-                'type': 'polygon',
-                'parents': point_ids,
-                'props': {}
-            })
-
-        elif intent == 'create_polygon':
-            vertices = data.get('vertices', [])
-            names = data.get('names', [])
-            
-            if not names:
-                names = [chr(65 + i) for i in range(len(vertices))]
-            
-            for i, vertex in enumerate(vertices):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [float(vertex[0]), float(vertex[1])],
-                    'props': {'name': names[i]}
-                })
-            
-            point_ids = [f'p{name}' for name in names]
-            result['elements'].append({
-                'id': 'polygon1',
-                'type': 'polygon',
-                'parents': point_ids,
-                'props': {}
-            })
-            
-        elif intent == 'create_line':
-            p1 = data.get('point1', [0, 0])
-            p2 = data.get('point2', [1, 1])
-            
-            result['elements'].append({
-                'id': 'pP1',
-                'type': 'point',
-                'parents': [float(p1[0]), float(p1[1])],
-                'props': {'name': 'P1'}
-            })
-            result['elements'].append({
-                'id': 'pP2',
-                'type': 'point',
-                'parents': [float(p2[0]), float(p2[1])],
-                'props': {'name': 'P2'}
-            })
-            result['elements'].append({
-                'id': 'line1',
-                'type': 'line',
-                'parents': ['pP1', 'pP2'],
-                'props': {}
-            })
-            
-        elif intent == 'calculate_distance':
-            p1 = data.get('point1', [0, 0])
-            p2 = data.get('point2', [1, 1])
-            distance = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
-            result['explanation'] = f'두 점 사이의 거리는 {distance:.4f}입니다.'
-            
-        elif intent == 'calculate_midpoint':
-            p1 = data.get('point1', [0, 0])
-            p2 = data.get('point2', [1, 1])
-            mx = (p1[0] + p2[0]) / 2
-            my = (p1[1] + p2[1]) / 2
-            
-            result['elements'].append({
-                'id': 'pM',
-                'type': 'point',
-                'parents': [round(mx, 6), round(my, 6)],
-                'props': {'name': 'M', 'color': 'red'}
-            })
-            result['explanation'] = f'중점 M({mx:.2f}, {my:.2f})을 표시했습니다.'
-        
-        else:
-            # 알 수 없는 intent - 그대로 반환 시도
-            result['explanation'] = f'처리할 수 없는 명령입니다: {intent}'
-            
-    except Exception as e:
-        result['explanation'] = f'계산 오류: {str(e)}'
-        print(f"Geometry calculation error: {e}")
-    
-    return result
 
 @app.get("/")
 def read_root():
-    return {"message": "DrawingExam API v2 - Intent-based Architecture"}
+    return {"message": "Graph Calculator API - SymPy + Function Plot"}
 
-@app.post("/generate", response_model=GeometryResponse)
-def generate_geometry(request: PromptRequest):
+@app.post("/generate")
+def generate_graph(request: PromptRequest):
     if not api_key:
         # Mock response for testing
-        mock_command = {
-            "intent": "create_triangle",
-            "data": {"type": "equilateral", "base_length": 5, "anchor": [0, 0]},
-            "explanation": "API Key 없음. 테스트 정삼각형입니다."
+        return {
+            "intent": "plot_function",
+            "data": {"expressions": ["sin(x)"]},
+            "explanation": "API Key 없음. 테스트로 sin(x) 그래프입니다."
         }
-        result = calculate_geometry(mock_command)
-        return GeometryResponse(
-            elements=[GeometryElement(**el) for el in result['elements']],
-            explanation=result['explanation']
-        )
 
     try:
         generation_config = {
@@ -414,7 +188,7 @@ def generate_geometry(request: PromptRequest):
         response = chat.send_message(request.prompt)
         text_response = response.text
         
-        print(f"DEBUG: Raw LLM Response: {text_response[:500]}...")
+        print(f"DEBUG: Raw LLM Response: {text_response}")
         
         # Clean up markdown code blocks if present
         if "```json" in text_response:
@@ -422,22 +196,15 @@ def generate_geometry(request: PromptRequest):
         elif "```" in text_response:
             text_response = text_response.split("```")[1].split("```")[0].strip()
 
-        # Parse LLM intent
+        # Parse and return LLM command directly
+        # SymPy processing will happen in the browser (Pyodide)
         llm_command = json.loads(text_response)
-        print("DEBUG: LLM Intent:", json.dumps(llm_command, indent=2, ensure_ascii=False))
-        
-        # Calculate geometry using math engine
-        result = calculate_geometry(llm_command)
-        print("DEBUG: Calculated Result:", json.dumps(result, indent=2, ensure_ascii=False))
+        print("DEBUG: LLM Command:", json.dumps(llm_command, indent=2, ensure_ascii=False))
 
-        return GeometryResponse(
-            elements=[GeometryElement(**el) for el in result['elements']],
-            explanation=result['explanation']
-        )
+        return llm_command
 
     except json.JSONDecodeError as e:
         print(f"JSON Parse Error: {e}")
-        print(f"Raw Response: {text_response}")
         raise HTTPException(status_code=500, detail=f"LLM 응답 파싱 실패: {str(e)}")
     except Exception as e:
         print(f"Error generating content: {e}")

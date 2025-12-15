@@ -1,6 +1,11 @@
 /**
- * Pyodide Web Worker
- * SymPy를 사용한 기하학 좌표 계산을 메인 스레드와 분리하여 실행
+ * Pyodide Web Worker - Graph Calculator Engine
+ * SymPy를 사용하여 수식을 JavaScript 코드로 변환
+ * 
+ * 문서 설계: "LLM은 번역하고, 엔진은 계산한다"
+ * - LLM → 수식 문자열 (예: "sin(x) + x**2")
+ * - SymPy → JavaScript 코드 (예: "Math.sin(x) + Math.pow(x, 2)")
+ * - Function Plot → 실시간 그래프 렌더링
  */
 
 let pyodide = null;
@@ -24,277 +29,293 @@ async function initPyodide() {
   // SymPy 설치
   await pyodide.loadPackage(['sympy', 'micropip']);
   
-  // 기하학 계산 헬퍼 함수 정의
+  // SymPy 초기화 및 헬퍼 함수 정의
   await pyodide.runPythonAsync(`
 import json
 from sympy import *
-from sympy.geometry import Point, Line, Circle, Triangle, Polygon, Segment
-import math
+from sympy.printing import jscode
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, convert_xor
 
-def calculate_geometry(command):
+# 파싱 변환 설정 (사용자 친화적 입력 지원)
+transformations = standard_transformations + (implicit_multiplication_application, convert_xor)
+
+def expr_to_js(expr_str):
     """
-    기하학 명령을 받아 JSXGraph용 좌표를 계산
+    수식 문자열을 Function Plot 호환 형식으로 변환
+    Function Plot은 sin(x), cos(x), log(x) 등을 직접 지원
+    거듭제곱은 ^ 사용 (예: x^2)
+    """
+    try:
+        x = Symbol('x')
+        # 사용자 친화적 파싱 (2x → 2*x, x^2 → x**2)
+        expr = parse_expr(expr_str, local_dict={'x': x, 'e': E, 'pi': pi}, transformations=transformations)
+        
+        # Function Plot 호환 형식으로 변환
+        # SymPy 표현식을 문자열로 변환 후 ** → ^ 로 치환
+        expr_str_clean = str(expr)
+        # ** 를 ^ 로 변환 (Function Plot 형식)
+        fn_plot_expr = expr_str_clean.replace('**', '^')
+        # exp(x)는 그대로 유지 (Function Plot이 exp() 지원)
+        
+        return json.dumps({
+            'success': True,
+            'jsCode': fn_plot_expr,
+            'latex': latex(expr),
+            'simplified': str(simplify(expr))
+        })
+    except Exception as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        })
+
+def differentiate(expr_str, order=1):
+    """미분 계산"""
+    try:
+        x = Symbol('x')
+        expr = parse_expr(expr_str, local_dict={'x': x, 'e': E, 'pi': pi}, transformations=transformations)
+        result = diff(expr, x, order)
+        
+        # Function Plot 호환 형식 (exp는 그대로 유지)
+        result_str = str(result).replace('**', '^')
+        
+        return json.dumps({
+            'success': True,
+            'jsCode': result_str,
+            'latex': latex(result),
+            'expression': str(result)
+        })
+    except Exception as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        })
+
+def integrate_expr(expr_str):
+    """적분 계산"""
+    try:
+        x = Symbol('x')
+        expr = parse_expr(expr_str, local_dict={'x': x, 'e': E, 'pi': pi}, transformations=transformations)
+        result = integrate(expr, x)
+        
+        # Function Plot 호환 형식 (exp는 그대로 유지)
+        result_str = str(result).replace('**', '^')
+        
+        return json.dumps({
+            'success': True,
+            'jsCode': result_str,
+            'latex': latex(result),
+            'expression': str(result)
+        })
+    except Exception as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        })
+
+def solve_equation(expr_str):
+    """방정식 풀이 (= 0으로 가정)"""
+    try:
+        x = Symbol('x')
+        expr = parse_expr(expr_str, local_dict={'x': x, 'e': E, 'pi': pi}, transformations=transformations)
+        solutions = solve(expr, x)
+        return json.dumps({
+            'success': True,
+            'solutions': [str(s) for s in solutions],
+            'numeric': [complex(N(s)) if im(s) != 0 else float(N(s)) for s in solutions if N(s).is_number]
+        })
+    except Exception as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        })
+
+def find_critical_points(expr_str):
+    """극값 찾기"""
+    try:
+        x = Symbol('x')
+        expr = parse_expr(expr_str, local_dict={'x': x, 'e': E, 'pi': pi}, transformations=transformations)
+        deriv = diff(expr, x)
+        critical = solve(deriv, x)
+        second_deriv = diff(deriv, x)
+        
+        points = []
+        for cp in critical:
+            if cp.is_real:
+                y_val = float(N(expr.subs(x, cp)))
+                second_val = N(second_deriv.subs(x, cp))
+                point_type = "maximum" if second_val < 0 else "minimum" if second_val > 0 else "inflection"
+                points.append({
+                    'x': float(N(cp)),
+                    'y': y_val,
+                    'type': point_type
+                })
+        
+        return json.dumps({
+            'success': True,
+            'points': points
+        })
+    except Exception as e:
+        return json.dumps({
+            'success': False,
+            'error': str(e)
+        })
+
+def process_graph_command(command):
+    """
+    그래프 명령 처리 메인 함수
     """
     try:
         intent = command.get('intent', '')
         data = command.get('data', {})
-        result = {'elements': [], 'explanation': ''}
         
-        if intent == 'create_point':
-            # 단순 점 생성
-            x, y = data.get('x', 0), data.get('y', 0)
-            name = data.get('name', 'P')
-            result['elements'].append({
-                'id': f'p{name}',
-                'type': 'point',
-                'parents': [float(x), float(y)],
-                'props': {'name': name}
-            })
-            result['explanation'] = f'점 {name}({x}, {y})을 생성했습니다.'
-            
-        elif intent == 'create_triangle':
-            triangle_type = data.get('type', 'general')
-            base = float(data.get('base_length', 5))
-            anchor = data.get('anchor', [0, 0])
-            ax, ay = anchor[0], anchor[1]
-            
-            if triangle_type == 'equilateral':
-                # 정삼각형: 모든 변의 길이가 같고, 모든 각이 60도
-                height = float(base * math.sqrt(3) / 2)
-                points = [
-                    (ax, ay),                    # A
-                    (ax + base, ay),             # B  
-                    (ax + base/2, ay + height)   # C
-                ]
-                names = ['A', 'B', 'C']
-                result['explanation'] = f'한 변의 길이가 {base}인 정삼각형을 그렸습니다.'
-                
-            elif triangle_type == 'isosceles':
-                # 이등변삼각형
-                height = float(data.get('height', base * 0.8))
-                points = [
-                    (ax, ay),
-                    (ax + base, ay),
-                    (ax + base/2, ay + height)
-                ]
-                names = ['A', 'B', 'C']
-                result['explanation'] = f'밑변 {base}, 높이 {height}인 이등변삼각형을 그렸습니다.'
-                
-            elif triangle_type == 'right':
-                # 직각삼각형
-                height = float(data.get('height', base * 0.75))
-                points = [
-                    (ax, ay),           # A (직각)
-                    (ax + base, ay),    # B
-                    (ax, ay + height)   # C
-                ]
-                names = ['A', 'B', 'C']
-                result['explanation'] = f'밑변 {base}, 높이 {height}인 직각삼각형을 그렸습니다. (A에서 직각)'
-                
-            else:  # general
-                # 일반 삼각형 (약간 불규칙하게)
-                points = [
-                    (ax, ay),
-                    (ax + base, ay),
-                    (ax + base * 0.3, ay + base * 0.7)
-                ]
-                names = ['A', 'B', 'C']
-                result['explanation'] = '일반 삼각형을 그렸습니다.'
-            
-            # 점 생성
-            for i, (px, py) in enumerate(points):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [float(px), float(py)],
-                    'props': {'name': names[i]}
-                })
-            
-            # 선분 생성
-            for i in range(3):
-                j = (i + 1) % 3
-                result['elements'].append({
-                    'id': f's{names[i]}{names[j]}',
-                    'type': 'segment',
-                    'parents': [f'p{names[i]}', f'p{names[j]}'],
-                    'props': {}
-                })
-                
-        elif intent == 'create_circle':
-            center = data.get('center', [0, 0])
-            radius = float(data.get('radius', 3))
-            name = data.get('name', 'O')
-            
-            # 중심점 생성
-            result['elements'].append({
-                'id': f'p{name}',
-                'type': 'point',
-                'parents': [float(center[0]), float(center[1])],
-                'props': {'name': name}
-            })
-            
-            # 원 생성
-            result['elements'].append({
-                'id': f'circle_{name}',
-                'type': 'circle',
-                'parents': [f'p{name}', radius],
-                'props': {}
-            })
-            
-            result['explanation'] = f'중심 ({center[0]}, {center[1]}), 반지름 {radius}인 원을 그렸습니다.'
-            
-        elif intent == 'create_polygon':
-            vertices = data.get('vertices', [])
-            names = data.get('names', [])
-            
-            if not names:
-                names = [chr(65 + i) for i in range(len(vertices))]
-            
-            # 점 생성
-            for i, vertex in enumerate(vertices):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [float(vertex[0]), float(vertex[1])],
-                    'props': {'name': names[i]}
-                })
-            
-            # 다각형 생성
-            point_ids = [f'p{name}' for name in names]
-            result['elements'].append({
-                'id': 'polygon1',
-                'type': 'polygon',
-                'parents': point_ids,
-                'props': {}
-            })
-            
-            result['explanation'] = f'{len(vertices)}각형을 그렸습니다.'
-            
-        elif intent == 'create_rectangle':
-            anchor = data.get('anchor', [0, 0])
-            width = float(data.get('width', 4))
-            height = float(data.get('height', 3))
-            ax, ay = anchor[0], anchor[1]
-            
-            points = [
-                (ax, ay),
-                (ax + width, ay),
-                (ax + width, ay + height),
-                (ax, ay + height)
-            ]
-            names = ['A', 'B', 'C', 'D']
-            
-            for i, (px, py) in enumerate(points):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [float(px), float(py)],
-                    'props': {'name': names[i]}
-                })
-            
-            point_ids = [f'p{name}' for name in names]
-            result['elements'].append({
-                'id': 'rect1',
-                'type': 'polygon',
-                'parents': point_ids,
-                'props': {}
-            })
-            
-            result['explanation'] = f'가로 {width}, 세로 {height}인 직사각형을 그렸습니다.'
-            
-        elif intent == 'create_square':
-            anchor = data.get('anchor', [0, 0])
-            side = float(data.get('side', 4))
-            ax, ay = anchor[0], anchor[1]
-            
-            points = [
-                (ax, ay),
-                (ax + side, ay),
-                (ax + side, ay + side),
-                (ax, ay + side)
-            ]
-            names = ['A', 'B', 'C', 'D']
-            
-            for i, (px, py) in enumerate(points):
-                result['elements'].append({
-                    'id': f'p{names[i]}',
-                    'type': 'point',
-                    'parents': [float(px), float(py)],
-                    'props': {'name': names[i]}
-                })
-            
-            point_ids = [f'p{name}' for name in names]
-            result['elements'].append({
-                'id': 'square1',
-                'type': 'polygon',
-                'parents': point_ids,
-                'props': {}
-            })
-            
-            result['explanation'] = f'한 변의 길이가 {side}인 정사각형을 그렸습니다.'
+        result = {
+            'success': True,
+            'graphs': [],
+            'annotations': [],
+            'explanation': command.get('explanation', '')
+        }
         
-        elif intent == 'create_line':
-            # 두 점을 지나는 직선
-            p1 = data.get('point1', [0, 0])
-            p2 = data.get('point2', [1, 1])
+        if intent == 'plot_function':
+            expressions = data.get('expressions', [])
+            colors = data.get('colors', ['#3b82f6', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6'])
             
-            result['elements'].append({
-                'id': 'pP1',
-                'type': 'point',
-                'parents': [float(p1[0]), float(p1[1])],
-                'props': {'name': 'P1'}
-            })
-            result['elements'].append({
-                'id': 'pP2',
-                'type': 'point',
-                'parents': [float(p2[0]), float(p2[1])],
-                'props': {'name': 'P2'}
-            })
-            result['elements'].append({
-                'id': 'line1',
-                'type': 'line',
-                'parents': ['pP1', 'pP2'],
-                'props': {}
-            })
+            for i, expr_str in enumerate(expressions):
+                converted = json.loads(expr_to_js(expr_str))
+                if converted['success']:
+                    result['graphs'].append({
+                        'fn': converted['jsCode'],
+                        'color': colors[i % len(colors)],
+                        'latex': converted['latex'],
+                        'original': expr_str
+                    })
+                else:
+                    result['graphs'].append({
+                        'error': converted['error'],
+                        'original': expr_str
+                    })
+        
+        elif intent == 'plot_derivative':
+            expr_str = data.get('expression', '')
+            order = data.get('order', 1)
             
-            result['explanation'] = f'점 ({p1[0]}, {p1[1]})과 ({p2[0]}, {p2[1]})을 지나는 직선을 그렸습니다.'
+            # 원본 함수
+            original = json.loads(expr_to_js(expr_str))
+            if original['success']:
+                result['graphs'].append({
+                    'fn': original['jsCode'],
+                    'color': '#3b82f6',
+                    'latex': original['latex'],
+                    'label': 'f(x)'
+                })
             
-        elif intent == 'calculate_distance':
-            p1 = Point(data['point1'][0], data['point1'][1])
-            p2 = Point(data['point2'][0], data['point2'][1])
-            distance = float(p1.distance(p2))
-            result['value'] = distance
-            result['explanation'] = f'두 점 사이의 거리는 {distance:.4f}입니다.'
+            # 도함수
+            derivative = json.loads(differentiate(expr_str, order))
+            if derivative['success']:
+                label = "f'" if order == 1 else f"f^({order})"
+                result['graphs'].append({
+                    'fn': derivative['jsCode'],
+                    'color': '#ef4444',
+                    'latex': derivative['latex'],
+                    'label': f"{label}(x)"
+                })
+                result['explanation'] = f"{expr_str}의 {order}차 도함수는 {derivative['expression']}입니다."
+        
+        elif intent == 'plot_integral':
+            expr_str = data.get('expression', '')
             
-        elif intent == 'calculate_midpoint':
-            p1 = Point(data['point1'][0], data['point1'][1])
-            p2 = Point(data['point2'][0], data['point2'][1])
-            midpoint = p1.midpoint(p2)
-            mx, my = float(midpoint.x), float(midpoint.y)
+            # 원본 함수
+            original = json.loads(expr_to_js(expr_str))
+            if original['success']:
+                result['graphs'].append({
+                    'fn': original['jsCode'],
+                    'color': '#3b82f6',
+                    'latex': original['latex'],
+                    'label': 'f(x)'
+                })
             
-            result['elements'].append({
-                'id': 'pM',
-                'type': 'point',
-                'parents': [mx, my],
-                'props': {'name': 'M', 'color': 'red'}
-            })
-            result['explanation'] = f'중점 M({mx:.2f}, {my:.2f})을 표시했습니다.'
+            # 부정적분
+            integral = json.loads(integrate_expr(expr_str))
+            if integral['success']:
+                result['graphs'].append({
+                    'fn': integral['jsCode'],
+                    'color': '#22c55e',
+                    'latex': integral['latex'],
+                    'label': '∫f(x)dx'
+                })
+                result['explanation'] = f"{expr_str}의 부정적분은 {integral['expression']} + C입니다."
+        
+        elif intent == 'solve_and_plot':
+            expr_str = data.get('expression', '')
+            
+            # 함수 그래프
+            converted = json.loads(expr_to_js(expr_str))
+            if converted['success']:
+                result['graphs'].append({
+                    'fn': converted['jsCode'],
+                    'color': '#3b82f6',
+                    'latex': converted['latex']
+                })
+            
+            # 근 찾기
+            solutions = json.loads(solve_equation(expr_str))
+            if solutions['success']:
+                for sol in solutions.get('numeric', []):
+                    if isinstance(sol, (int, float)) and -100 < sol < 100:
+                        result['annotations'].append({
+                            'x': sol,
+                            'y': 0,
+                            'text': f'x = {sol:.4g}'
+                        })
+                result['explanation'] = f"방정식의 근: {', '.join(solutions['solutions'])}"
+        
+        elif intent == 'find_extrema':
+            expr_str = data.get('expression', '')
+            
+            # 함수 그래프
+            converted = json.loads(expr_to_js(expr_str))
+            if converted['success']:
+                result['graphs'].append({
+                    'fn': converted['jsCode'],
+                    'color': '#3b82f6',
+                    'latex': converted['latex']
+                })
+            
+            # 극값 찾기
+            critical = json.loads(find_critical_points(expr_str))
+            if critical['success']:
+                for pt in critical['points']:
+                    result['annotations'].append({
+                        'x': pt['x'],
+                        'y': pt['y'],
+                        'text': f"{'극대' if pt['type'] == 'maximum' else '극소' if pt['type'] == 'minimum' else '변곡점'}"
+                    })
+                result['explanation'] = f"극값 포인트: {len(critical['points'])}개 발견"
         
         else:
-            result['explanation'] = f'알 수 없는 명령: {intent}'
-            
+            # 기본: 수식을 함수로 처리
+            expr_str = data.get('expression', str(data))
+            converted = json.loads(expr_to_js(expr_str))
+            if converted['success']:
+                result['graphs'].append({
+                    'fn': converted['jsCode'],
+                    'color': '#3b82f6',
+                    'latex': converted['latex']
+                })
+        
         return json.dumps(result)
         
     except Exception as e:
         return json.dumps({
-            'elements': [],
-            'explanation': f'계산 오류: {str(e)}',
-            'error': str(e)
+            'success': False,
+            'error': str(e),
+            'graphs': [],
+            'annotations': []
         })
 `);
   
   sympyLoaded = true;
-  self.postMessage({ type: 'status', status: 'ready', message: 'SymPy 준비 완료!' });
+  self.postMessage({ type: 'status', status: 'ready', message: 'SymPy 엔진 준비 완료!' });
   
   return pyodide;
 }
@@ -309,23 +330,69 @@ self.onmessage = async function(e) {
       return;
     }
     
-    if (type === 'calculate') {
+    if (type === 'convert') {
+      // 단순 수식 → JS 변환
       if (!pyodide || !sympyLoaded) {
         await initPyodide();
       }
       
-      // Python에서 기하학 계산 실행
-      const commandJson = JSON.stringify(payload);
       const resultJson = await pyodide.runPythonAsync(`
-calculate_geometry(${JSON.stringify(payload)})
+expr_to_js(${JSON.stringify(payload.expression)})
       `);
-      
-      const result = JSON.parse(resultJson);
       
       self.postMessage({
         type: 'result',
         id: id,
-        payload: result
+        payload: JSON.parse(resultJson)
+      });
+    }
+    
+    if (type === 'process') {
+      // 그래프 명령 처리
+      if (!pyodide || !sympyLoaded) {
+        await initPyodide();
+      }
+      
+      const resultJson = await pyodide.runPythonAsync(`
+process_graph_command(${JSON.stringify(payload)})
+      `);
+      
+      self.postMessage({
+        type: 'result',
+        id: id,
+        payload: JSON.parse(resultJson)
+      });
+    }
+    
+    if (type === 'differentiate') {
+      if (!pyodide || !sympyLoaded) {
+        await initPyodide();
+      }
+      
+      const resultJson = await pyodide.runPythonAsync(`
+differentiate(${JSON.stringify(payload.expression)}, ${payload.order || 1})
+      `);
+      
+      self.postMessage({
+        type: 'result',
+        id: id,
+        payload: JSON.parse(resultJson)
+      });
+    }
+    
+    if (type === 'integrate') {
+      if (!pyodide || !sympyLoaded) {
+        await initPyodide();
+      }
+      
+      const resultJson = await pyodide.runPythonAsync(`
+integrate_expr(${JSON.stringify(payload.expression)})
+      `);
+      
+      self.postMessage({
+        type: 'result',
+        id: id,
+        payload: JSON.parse(resultJson)
       });
     }
     
@@ -346,4 +413,3 @@ initPyodide().catch(err => {
     message: `초기화 실패: ${err.message}` 
   });
 });
-
