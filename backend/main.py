@@ -6,7 +6,7 @@ import os
 import google.generativeai as genai
 from dotenv import load_dotenv
 import json
-import re
+import math
 
 load_dotenv()
 
@@ -43,70 +43,351 @@ class GeometryResponse(BaseModel):
     explanation: str
 
 class ChatMessage(BaseModel):
-    role: str  # "user" or "assistant" (will be converted to "model" for Gemini)
+    role: str
     content: str
 
 class PromptRequest(BaseModel):
     prompt: str
-    history: Optional[List[ChatMessage]] = Field(default_factory=list, description="Previous conversation history")
+    history: Optional[List[ChatMessage]] = Field(default_factory=list)
 
-# --- Gemini Logic ---
+# --- NEW: Intent-based System Instruction ---
+# LLM은 좌표를 계산하지 않고, 의도(intent)와 파라미터만 출력
 SYSTEM_INSTRUCTION = """
-You are a Geometry Engine. Convert natural language descriptions into a structured JSON for JSXGraph.
+You are a Geometry Intent Parser. Convert natural language to structured geometric commands.
 
-Supported Types & Parents:
-- point: [x, y] where x and y are NUMBERS (e.g., [0, 5], [-3.5, 2.1])
-- line: ["point_id1", "point_id2"]
-- segment: ["point_id1", "point_id2"]
-- circle: ["center_point_id", radius_number] OR ["center_point_id", "radius_point_id"]
-- polygon: ["point_id1", "point_id2", "point_id3", ...]
-- angle: ["point_id1", "vertex_point_id", "point_id2"] (the angle at the vertex)
+**YOUR ROLE**: Parse user intent into structured JSON. DO NOT calculate coordinates - the math engine will do that.
 
-CRITICAL RULES:
-1. Return ONLY valid JSON with "elements" (array) and "explanation" (string).
-2. **Point coordinates MUST be numbers**, NOT functions or expressions. Calculate the actual coordinates.
-3. All string values in parents MUST be element IDs (e.g., "p1", "pA"), NOT JavaScript code.
-4. "props" should be a simple dictionary (e.g., {"name": "A", "strokeColor": "red"}).
-5. **DO NOT use JavaScript functions, callbacks, or dynamic calculations in parents.**
-6. **DO NOT create abstract types** like 'var', 'variable', 'value', 'solve'.
-7. If the user asks to "find x", draw the shape and note the answer in explanation.
-8. **Context Awareness:** If coordinates are provided in [Context...], use those exact coordinates.
-9. **Conversation Memory:** Understand context from previous messages.
-
-When calculating point positions:
-- For triangles: Calculate coordinates using trigonometry, then provide FIXED numbers.
-- For angles: Use the angle element type with 3 point IDs.
-- Always pre-calculate and provide actual numeric coordinates.
-
-Example Output:
+**OUTPUT FORMAT**:
 {
-  "elements": [
-    {"id": "pA", "type": "point", "parents": [0, 0], "props": {"name": "A"}},
-    {"id": "pB", "type": "point", "parents": [5, 0], "props": {"name": "B"}},
-    {"id": "pC", "type": "point", "parents": [2.5, 4.33], "props": {"name": "C"}},
-    {"id": "sAB", "type": "segment", "parents": ["pA", "pB"], "props": {}},
-    {"id": "sBC", "type": "segment", "parents": ["pB", "pC"], "props": {}},
-    {"id": "sCA", "type": "segment", "parents": ["pC", "pA"], "props": {}},
-    {"id": "angleA", "type": "angle", "parents": ["pB", "pA", "pC"], "props": {"name": "60°"}}
-  ],
-  "explanation": "Drew an equilateral triangle ABC with side length 5."
+  "intent": "<command_type>",
+  "data": { <parameters> },
+  "explanation": "<user-friendly Korean explanation>"
 }
+
+**SUPPORTED INTENTS**:
+
+1. `create_triangle` - 삼각형 생성
+   - data: { "type": "equilateral|isosceles|right|general", "base_length": number, "anchor": [x, y], "height": number (optional) }
+   
+2. `create_circle` - 원 생성
+   - data: { "center": [x, y], "radius": number, "name": string }
+   
+3. `create_rectangle` - 직사각형 생성
+   - data: { "anchor": [x, y], "width": number, "height": number }
+   
+4. `create_square` - 정사각형 생성
+   - data: { "anchor": [x, y], "side": number }
+
+5. `create_polygon` - 다각형 생성
+   - data: { "vertices": [[x1,y1], [x2,y2], ...], "names": ["A", "B", ...] }
+
+6. `create_point` - 점 생성
+   - data: { "x": number, "y": number, "name": string }
+
+7. `create_line` - 직선 생성
+   - data: { "point1": [x, y], "point2": [x, y] }
+
+8. `calculate_distance` - 거리 계산
+   - data: { "point1": [x, y], "point2": [x, y] }
+
+9. `calculate_midpoint` - 중점 계산
+   - data: { "point1": [x, y], "point2": [x, y] }
+
+10. `modify_element` - 요소 수정
+    - data: { "element_id": string, "property": string, "value": any }
+
+**EXAMPLES**:
+
+User: "정삼각형을 그려줘"
+{
+  "intent": "create_triangle",
+  "data": { "type": "equilateral", "base_length": 5, "anchor": [0, 0] },
+  "explanation": "한 변의 길이가 5인 정삼각형을 그렸습니다."
+}
+
+User: "반지름이 3인 원을 중심 (2, 4)에 그려줘"
+{
+  "intent": "create_circle",
+  "data": { "center": [2, 4], "radius": 3, "name": "O" },
+  "explanation": "중심이 (2, 4)이고 반지름이 3인 원을 그렸습니다."
+}
+
+User: "가로 6, 세로 4인 직사각형"
+{
+  "intent": "create_rectangle",
+  "data": { "anchor": [0, 0], "width": 6, "height": 4 },
+  "explanation": "가로 6, 세로 4인 직사각형을 그렸습니다."
+}
+
+User: "직각삼각형, 밑변 4, 높이 3"
+{
+  "intent": "create_triangle",
+  "data": { "type": "right", "base_length": 4, "height": 3, "anchor": [0, 0] },
+  "explanation": "밑변 4, 높이 3인 직각삼각형을 그렸습니다."
+}
+
+**RULES**:
+1. Return ONLY valid JSON
+2. Use reasonable default values (anchor: [0,0], base_length: 5, radius: 3)
+3. Explanation should be in Korean
+4. DO NOT calculate actual vertex coordinates - just provide parameters
+5. If user gives context about existing points, incorporate them
 """
+
+# --- SymPy-based Geometry Calculator ---
+def calculate_geometry(command: dict) -> dict:
+    """
+    수학 엔진: LLM의 의도(intent)를 받아 정확한 좌표를 계산
+    """
+    intent = command.get('intent', '')
+    data = command.get('data', {})
+    explanation = command.get('explanation', '')
+    
+    result = {'elements': [], 'explanation': explanation}
+    
+    try:
+        if intent == 'create_point':
+            x, y = data.get('x', 0), data.get('y', 0)
+            name = data.get('name', 'P')
+            result['elements'].append({
+                'id': f'p{name}',
+                'type': 'point',
+                'parents': [float(x), float(y)],
+                'props': {'name': name}
+            })
+            
+        elif intent == 'create_triangle':
+            triangle_type = data.get('type', 'general')
+            base = float(data.get('base_length', 5))
+            anchor = data.get('anchor', [0, 0])
+            ax, ay = float(anchor[0]), float(anchor[1])
+            
+            if triangle_type == 'equilateral':
+                # 정삼각형: 정확한 계산 (SymPy 대신 math 사용)
+                height = base * math.sqrt(3) / 2
+                points = [
+                    (ax, ay),                    # A
+                    (ax + base, ay),             # B  
+                    (ax + base/2, ay + height)   # C
+                ]
+                names = ['A', 'B', 'C']
+                
+            elif triangle_type == 'isosceles':
+                height = float(data.get('height', base * 0.8))
+                points = [
+                    (ax, ay),
+                    (ax + base, ay),
+                    (ax + base/2, ay + height)
+                ]
+                names = ['A', 'B', 'C']
+                
+            elif triangle_type == 'right':
+                height = float(data.get('height', base * 0.75))
+                points = [
+                    (ax, ay),           # A (직각)
+                    (ax + base, ay),    # B
+                    (ax, ay + height)   # C
+                ]
+                names = ['A', 'B', 'C']
+                
+            else:  # general
+                points = [
+                    (ax, ay),
+                    (ax + base, ay),
+                    (ax + base * 0.3, ay + base * 0.7)
+                ]
+                names = ['A', 'B', 'C']
+            
+            # 점 생성
+            for i, (px, py) in enumerate(points):
+                result['elements'].append({
+                    'id': f'p{names[i]}',
+                    'type': 'point',
+                    'parents': [round(px, 6), round(py, 6)],
+                    'props': {'name': names[i]}
+                })
+            
+            # 선분 생성
+            for i in range(3):
+                j = (i + 1) % 3
+                result['elements'].append({
+                    'id': f's{names[i]}{names[j]}',
+                    'type': 'segment',
+                    'parents': [f'p{names[i]}', f'p{names[j]}'],
+                    'props': {}
+                })
+                
+        elif intent == 'create_circle':
+            center = data.get('center', [0, 0])
+            radius = float(data.get('radius', 3))
+            name = data.get('name', 'O')
+            
+            result['elements'].append({
+                'id': f'p{name}',
+                'type': 'point',
+                'parents': [float(center[0]), float(center[1])],
+                'props': {'name': name}
+            })
+            
+            result['elements'].append({
+                'id': f'circle_{name}',
+                'type': 'circle',
+                'parents': [f'p{name}', radius],
+                'props': {}
+            })
+            
+        elif intent == 'create_rectangle':
+            anchor = data.get('anchor', [0, 0])
+            width = float(data.get('width', 4))
+            height = float(data.get('height', 3))
+            ax, ay = float(anchor[0]), float(anchor[1])
+            
+            points = [
+                (ax, ay),
+                (ax + width, ay),
+                (ax + width, ay + height),
+                (ax, ay + height)
+            ]
+            names = ['A', 'B', 'C', 'D']
+            
+            for i, (px, py) in enumerate(points):
+                result['elements'].append({
+                    'id': f'p{names[i]}',
+                    'type': 'point',
+                    'parents': [round(px, 6), round(py, 6)],
+                    'props': {'name': names[i]}
+                })
+            
+            point_ids = [f'p{name}' for name in names]
+            result['elements'].append({
+                'id': 'rect1',
+                'type': 'polygon',
+                'parents': point_ids,
+                'props': {}
+            })
+            
+        elif intent == 'create_square':
+            anchor = data.get('anchor', [0, 0])
+            side = float(data.get('side', 4))
+            ax, ay = float(anchor[0]), float(anchor[1])
+            
+            points = [
+                (ax, ay),
+                (ax + side, ay),
+                (ax + side, ay + side),
+                (ax, ay + side)
+            ]
+            names = ['A', 'B', 'C', 'D']
+            
+            for i, (px, py) in enumerate(points):
+                result['elements'].append({
+                    'id': f'p{names[i]}',
+                    'type': 'point',
+                    'parents': [round(px, 6), round(py, 6)],
+                    'props': {'name': names[i]}
+                })
+            
+            point_ids = [f'p{name}' for name in names]
+            result['elements'].append({
+                'id': 'square1',
+                'type': 'polygon',
+                'parents': point_ids,
+                'props': {}
+            })
+
+        elif intent == 'create_polygon':
+            vertices = data.get('vertices', [])
+            names = data.get('names', [])
+            
+            if not names:
+                names = [chr(65 + i) for i in range(len(vertices))]
+            
+            for i, vertex in enumerate(vertices):
+                result['elements'].append({
+                    'id': f'p{names[i]}',
+                    'type': 'point',
+                    'parents': [float(vertex[0]), float(vertex[1])],
+                    'props': {'name': names[i]}
+                })
+            
+            point_ids = [f'p{name}' for name in names]
+            result['elements'].append({
+                'id': 'polygon1',
+                'type': 'polygon',
+                'parents': point_ids,
+                'props': {}
+            })
+            
+        elif intent == 'create_line':
+            p1 = data.get('point1', [0, 0])
+            p2 = data.get('point2', [1, 1])
+            
+            result['elements'].append({
+                'id': 'pP1',
+                'type': 'point',
+                'parents': [float(p1[0]), float(p1[1])],
+                'props': {'name': 'P1'}
+            })
+            result['elements'].append({
+                'id': 'pP2',
+                'type': 'point',
+                'parents': [float(p2[0]), float(p2[1])],
+                'props': {'name': 'P2'}
+            })
+            result['elements'].append({
+                'id': 'line1',
+                'type': 'line',
+                'parents': ['pP1', 'pP2'],
+                'props': {}
+            })
+            
+        elif intent == 'calculate_distance':
+            p1 = data.get('point1', [0, 0])
+            p2 = data.get('point2', [1, 1])
+            distance = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+            result['explanation'] = f'두 점 사이의 거리는 {distance:.4f}입니다.'
+            
+        elif intent == 'calculate_midpoint':
+            p1 = data.get('point1', [0, 0])
+            p2 = data.get('point2', [1, 1])
+            mx = (p1[0] + p2[0]) / 2
+            my = (p1[1] + p2[1]) / 2
+            
+            result['elements'].append({
+                'id': 'pM',
+                'type': 'point',
+                'parents': [round(mx, 6), round(my, 6)],
+                'props': {'name': 'M', 'color': 'red'}
+            })
+            result['explanation'] = f'중점 M({mx:.2f}, {my:.2f})을 표시했습니다.'
+        
+        else:
+            # 알 수 없는 intent - 그대로 반환 시도
+            result['explanation'] = f'처리할 수 없는 명령입니다: {intent}'
+            
+    except Exception as e:
+        result['explanation'] = f'계산 오류: {str(e)}'
+        print(f"Geometry calculation error: {e}")
+    
+    return result
 
 @app.get("/")
 def read_root():
-    return {"message": "DrawingExam API is running"}
+    return {"message": "DrawingExam API v2 - Intent-based Architecture"}
 
 @app.post("/generate", response_model=GeometryResponse)
 def generate_geometry(request: PromptRequest):
     if not api_key:
+        # Mock response for testing
+        mock_command = {
+            "intent": "create_triangle",
+            "data": {"type": "equilateral", "base_length": 5, "anchor": [0, 0]},
+            "explanation": "API Key 없음. 테스트 정삼각형입니다."
+        }
+        result = calculate_geometry(mock_command)
         return GeometryResponse(
-            elements=[
-                GeometryElement(id="p1", type="point", parents=[-2, -2], props={"name": "A"}),
-                GeometryElement(id="p2", type="point", parents=[2, 2], props={"name": "B"}),
-                GeometryElement(id="l1", type="line", parents=["p1", "p2"], props={"strokeColor": "blue"})
-            ],
-            explanation="API Key missing. Mock data."
+            elements=[GeometryElement(**el) for el in result['elements']],
+            explanation=result['explanation']
         )
 
     try:
@@ -123,21 +404,17 @@ def generate_geometry(request: PromptRequest):
         # Convert history to Gemini format
         gemini_history = []
         for msg in request.history:
-            # Gemini uses "model" instead of "assistant"
             role = "model" if msg.role == "assistant" else "user"
             gemini_history.append({
                 "role": role,
                 "parts": [msg.content]
             })
         
-        # Start chat with history
         chat = model.start_chat(history=gemini_history)
-        
-        # Send current message and get response
         response = chat.send_message(request.prompt)
         text_response = response.text
         
-        print(f"DEBUG: Raw AI Response: {text_response[:500]}...")
+        print(f"DEBUG: Raw LLM Response: {text_response[:500]}...")
         
         # Clean up markdown code blocks if present
         if "```json" in text_response:
@@ -145,64 +422,27 @@ def generate_geometry(request: PromptRequest):
         elif "```" in text_response:
             text_response = text_response.split("```")[1].split("```")[0].strip()
 
-        parsed = json.loads(text_response)
-        print("DEBUG: Parsed AI Response:", json.dumps(parsed, indent=2))
+        # Parse LLM intent
+        llm_command = json.loads(text_response)
+        print("DEBUG: LLM Intent:", json.dumps(llm_command, indent=2, ensure_ascii=False))
         
-        # Map directly to response model with validation
-        final_elements = []
-        for el in parsed.get("elements", []):
-            parents = el.get("parents", [])
-            
-            # Validate parents - skip elements with invalid parents
-            valid_parents = True
-            cleaned_parents = []
-            for p in parents:
-                # Check for JavaScript function strings (invalid)
-                if isinstance(p, str):
-                    # Valid string parents are short IDs like "p1", "pA", "center"
-                    # Invalid are long strings containing "=>", "function", "return", etc.
-                    if any(keyword in p for keyword in ["=>", "function", "return", "()", "JXG", "Math."]):
-                        print(f"WARNING: Skipping element {el.get('id')} - contains JavaScript in parents")
-                        valid_parents = False
-                        break
-                    cleaned_parents.append(p)
-                elif isinstance(p, (int, float)):
-                    cleaned_parents.append(float(p))
-                else:
-                    # Try to convert to number
-                    try:
-                        cleaned_parents.append(float(p))
-                    except (ValueError, TypeError):
-                        cleaned_parents.append(str(p))
-            
-            if not valid_parents:
-                continue
-                
-            final_elements.append(GeometryElement(
-                id=el.get("id", "unknown"),
-                type=el.get("type", "point"),
-                parents=cleaned_parents,
-                props=el.get("props", {})
-            ))
+        # Calculate geometry using math engine
+        result = calculate_geometry(llm_command)
+        print("DEBUG: Calculated Result:", json.dumps(result, indent=2, ensure_ascii=False))
 
         return GeometryResponse(
-            elements=final_elements,
-            explanation=parsed.get("explanation", "")
+            elements=[GeometryElement(**el) for el in result['elements']],
+            explanation=result['explanation']
         )
 
+    except json.JSONDecodeError as e:
+        print(f"JSON Parse Error: {e}")
+        print(f"Raw Response: {text_response}")
+        raise HTTPException(status_code=500, detail=f"LLM 응답 파싱 실패: {str(e)}")
     except Exception as e:
         print(f"Error generating content: {e}")
-        try:
-            print(f"Raw Response: {response.text}")
-        except:
-            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
