@@ -1,8 +1,9 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import dynamic from 'next/dynamic';
 import { usePyodide } from '@/hooks/usePyodide';
+import { GraphData } from '@/components/GraphCalculator';
 
 // Dynamically import GraphCalculator with SSR disabled
 const GraphCalculator = dynamic(() => import('@/components/GraphCalculator'), { 
@@ -19,19 +20,18 @@ interface Message {
   content: string;
 }
 
-interface GraphData {
-  fn: string;
-  color?: string;
-  latex?: string;
-  label?: string;
-  original?: string;
-}
-
 interface Annotation {
   x: number;
   y: number;
   text: string;
 }
+
+// 기본 색상 팔레트
+const COLORS = ['#3b82f6', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6'];
+
+// 고유 ID 생성
+let idCounter = 0;
+const generateId = () => `graph_${Date.now()}_${idCounter++}`;
 
 export default function DrawingApp() {
   const [messages, setMessages] = useState<Message[]>([
@@ -43,7 +43,37 @@ export default function DrawingApp() {
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   
   // Pyodide 훅 (SymPy 수식 변환용)
-  const { status: pyodideStatus, isReady: pyodideReady, processGraphCommand } = usePyodide();
+  const { status: pyodideStatus, isReady: pyodideReady, processGraphCommand, convert } = usePyodide();
+
+  // 그래프 업데이트 (수식 편집)
+  const handleGraphUpdate = useCallback(async (id: string, newSympy: string) => {
+    if (!pyodideReady) return;
+    
+    try {
+      const result = await convert(newSympy);
+      if (result.success && result.jsCode) {
+        setGraphs(prev => prev.map(g => 
+          g.id === id 
+            ? { ...g, sympy: newSympy, fn: result.jsCode!, latex: result.latex || newSympy }
+            : g
+        ));
+      }
+    } catch (error) {
+      console.error('수식 변환 실패:', error);
+    }
+  }, [pyodideReady, convert]);
+
+  // 그래프 삭제
+  const handleGraphDelete = useCallback((id: string) => {
+    setGraphs(prev => prev.filter(g => g.id !== id));
+  }, []);
+
+  // 그래프 표시/숨기기 토글
+  const handleGraphToggle = useCallback((id: string) => {
+    setGraphs(prev => prev.map(g => 
+      g.id === id ? { ...g, visible: !g.visible } : g
+    ));
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -79,7 +109,18 @@ export default function DrawingApp() {
           console.log('SymPy Result:', result);
           
           if (result.success && result.graphs.length > 0) {
-            setGraphs(result.graphs);
+            // 새 그래프 데이터 변환 (id, visible 추가)
+            const newGraphs: GraphData[] = result.graphs.map((g: any, idx: number) => ({
+              id: generateId(),
+              fn: g.fn || g.jsCode,
+              sympy: g.original || g.fn,
+              latex: g.latex || g.fn,
+              color: g.color || COLORS[idx % COLORS.length],
+              label: g.label,
+              visible: true
+            }));
+            
+            setGraphs(newGraphs);
             setAnnotations(result.annotations || []);
             
             setMessages(prev => [...prev, { 
@@ -114,6 +155,29 @@ export default function DrawingApp() {
       setLoading(false);
     }
   };
+
+  // 수식 직접 추가
+  const handleAddExpression = useCallback(async () => {
+    if (!pyodideReady) return;
+    
+    const newSympy = 'x';
+    try {
+      const result = await convert(newSympy);
+      if (result.success) {
+        const newGraph: GraphData = {
+          id: generateId(),
+          fn: result.jsCode || newSympy,
+          sympy: newSympy,
+          latex: result.latex || newSympy,
+          color: COLORS[graphs.length % COLORS.length],
+          visible: true
+        };
+        setGraphs(prev => [...prev, newGraph]);
+      }
+    } catch (error) {
+      console.error('수식 추가 실패:', error);
+    }
+  }, [pyodideReady, convert, graphs.length]);
 
   return (
     <main className="flex h-screen flex-col md:flex-row bg-gradient-to-br from-slate-900 to-slate-800 p-4 gap-4">
@@ -167,7 +231,16 @@ export default function DrawingApp() {
 
         {/* 예시 버튼 영역 */}
         <div className="px-4 py-3 border-t bg-white">
-          <p className="text-xs text-gray-500 mb-2">예시:</p>
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-xs text-gray-500">예시:</p>
+            <button
+              onClick={handleAddExpression}
+              disabled={!pyodideReady}
+              className="text-xs px-2 py-1 bg-gray-100 text-gray-600 rounded hover:bg-gray-200 disabled:opacity-50"
+            >
+              + 수식 추가
+            </button>
+          </div>
           <div className="flex flex-wrap gap-2">
             <button 
               onClick={() => setInput('sin(x) 그래프 그려줘')}
@@ -226,6 +299,9 @@ export default function DrawingApp() {
         <GraphCalculator 
           graphs={graphs}
           annotations={annotations}
+          onGraphUpdate={handleGraphUpdate}
+          onGraphDelete={handleGraphDelete}
+          onGraphToggle={handleGraphToggle}
         />
       </div>
     </main>

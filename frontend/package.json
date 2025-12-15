@@ -11,6 +11,7 @@
   "dependencies": {
     "function-plot": "^1.25.1",
     "jsxgraph": "^1.12.2",
+    "mathquill": "^0.10.1-a",
     "next": "16.0.8",
     "react": "19.2.1",
     "react-dom": "19.2.1"
